@@ -1,7 +1,9 @@
 import random
-import asyncpg
-from .db import *
-from .log import botlogger, dblogger
+
+import math
+
+from db import *
+from log import botlogger, dblogger
 from core.data.cards import *
 
 CARD_DROPRATE: dict[int, list[int]] = {
@@ -48,9 +50,9 @@ def generate_card(run: asyncpg.Record, level: int) -> list[str]:
 
 @with_player_context
 def on_gain_xp(run: asyncpg.Record, xp: int) -> tuple[int, int]:
-    temp_xp: int = run['xp'] + xp
+    temp_xp: float = run['xp'] + xp
     level: int = run['run_level']
-    xp_threshold: int = 100 * 1.25**(level-1)
+    xp_threshold: float = 100 * 1.25**(level-1)
     level_increment: int = 0
 
     while temp_xp >= xp_threshold:
@@ -58,15 +60,15 @@ def on_gain_xp(run: asyncpg.Record, xp: int) -> tuple[int, int]:
         curr_level: int = level+level_increment
 
         temp_xp -= xp_threshold
-        xp_threshold = 100 * 1.25**((curr_level)-1)
+        xp_threshold = 100 * 1.25**(curr_level - 1)
 
-    return level_increment, temp_xp
+    return level_increment, math.floor(temp_xp)
 
 @with_player_context
 async def on_death(user: discord.User, player: asyncpg.Record, equipment: asyncpg.Record, victory: bool) -> bool:
     if not player:
         # this should not happen
-        # if it triggers, there may be an issue with fetch_player or with_player_context
+        # if it triggers, there may be an issue with fetch_player_context or with_player_context
         dblogger.error(f"Unable to kill player: Player not found. Userid {user.id}")
         return False
 
@@ -76,10 +78,13 @@ async def on_death(user: discord.User, player: asyncpg.Record, equipment: asyncp
         dblogger.error(f"Unable to kill player: Failed to update user database on death. Userid {user.id}.")
         return False
 
-    for gear in equipment:
+    relic_gained = 0
+    for gear in equipment.values():
         # relic gained = gear tier * 50 base val
         # temporary; may change over time
-        update_relic(user, relic=player['relic'] + (gear['tier'] * 50) * (1.2 if victory else 0.7))
+        relic_gained += int((gear['tier'] * 50) * (1.2 if victory else 0.7))
+        
+    if relic_gained > 0:
+        await update(user, relic=relic_gained)
 
     return True
-    

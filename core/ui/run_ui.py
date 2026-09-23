@@ -31,7 +31,8 @@ class RunConfirmationView(discord.ui.View):
 
         if run is None:
             # Fallback if startrun failed (e.g. run already exists)
-            run, db_error = await db.fetchrun(interaction.user)
+            context, db_error = await db.fetch_player_context(interaction.user, run=True)
+            run = context['run'] if not db_error else None
             if db_error or run is None:
                 dblogger.error(f"Unable to start run for {interaction.user.id}. run output:\n{run}")
                 await interaction.response.edit_message(content="Error starting run. Do you have a character?", view=None)
@@ -104,7 +105,8 @@ class BasecampView(BaseRoomView):
 class BattleView(BaseRoomView):
     @discord.ui.button(label="Next", style=discord.ButtonStyle.green)
     async def next(self, interaction: discord.Interaction, button: discord.ui.Button):
-        run, db_error = await db.fetchrun(self.original_user)
+        context, db_error = await db.fetch_player_context(self.original_user, run=True)
+        run = context['run'] if not db_error else None
         if db_error or not run:
             await interaction.response.send_message("Error fetching run data.", ephemeral=True)
             return
@@ -112,9 +114,7 @@ class BattleView(BaseRoomView):
         current_level = run['run_level']
         
         level_increment, xp = await on_gain_xp(user=self.original_user, xp=100) # temp placeholder xp
-
-        await db.update_xp(user=self.original_user, xp=xp, levelup=level_increment)
-
+        await db.update(user=self.original_user, xp=xp, levelup=level_increment)
         if level_increment > 0:
             levels_to_process = [current_level + i + 1 for i in range(level_increment)]
             

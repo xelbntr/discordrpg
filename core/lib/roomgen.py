@@ -1,5 +1,5 @@
 import random
-from data.rooms import ROOMS, ROOMS_BY_FLOOR
+from core.data.rooms import ROOMS, ROOMS_BY_FLOOR
 
 # config
 TOTAL_FLOORS = 4

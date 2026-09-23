@@ -76,38 +76,43 @@ async def set_class(
     ''', class_name, user.id)
 
 @db_exception_handler
-async def fetch_player(
+async def fetch_player_context(
     user: discord.User,
     *,
+    player: bool = False,
+    equipment: bool = False,
+    run: bool = False,
     conn: asyncpg.Connection | None = None
 ):
-    if conn is None:
-        raise RuntimeError("Database connection was not provided.")
-    player = await conn.fetchrow('SELECT * FROM players WHERE user_id = $1', user.id)
-    return player
+    """Return (context, db_error), fetching only requested keys in one connection.
 
-@db_exception_handler
-async def fetch_equipment(
-    user: discord.User,
-    *,
-    conn: asyncpg.Connection | None = None
-):
+    Missing player/run rows are None; missing equipment is an empty dict.
+    """
     if conn is None:
         raise RuntimeError("Database connection was not provided.")
-    records = await conn.fetch('''
-        SELECT i.* 
-        FROM run_equipment e
-        JOIN run_inventory i ON i.instance_id IN (
-            e.armor_instance_id, 
-            e.weapon_instance_id, 
-            e.secondary_instance_id
+
+    context = {}
+    if player:
+        context['player'] = await conn.fetchrow(
+            'SELECT * FROM players WHERE user_id = $1', user.id
         )
-        WHERE e.user_id = $1
-    ''', user.id)
-
-    # gear_slot = ['armor', 'weapon', 'secondary']
-    equipment = {record['slot']: record for record in records}
-    return equipment
+    if equipment:
+        records = await conn.fetch('''
+            SELECT i.* 
+            FROM run_equipment e
+            JOIN run_inventory i ON i.instance_id IN (
+                e.armor_instance_id, 
+                e.weapon_instance_id, 
+                e.secondary_instance_id
+            )
+            WHERE e.user_id = $1
+        ''', user.id)
+        context['equipment'] = {record['slot']: record for record in records}
+    if run:
+        context['run'] = await conn.fetchrow(
+            'SELECT * FROM runs WHERE user_id = $1', user.id
+        )
+    return context
 
 def with_player_context(func):
     @wraps(func)
@@ -148,30 +153,23 @@ def with_player_context(func):
                     if not ctx_or_interaction.response.is_done():
                         await ctx_or_interaction.response.send_message(msg, ephemeral=True) 
 
-        player = None
-        if needs_player or needs_class:
-            player, db_error = await fetch_player(user)
+        context = {}
+        if needs_player or needs_class or needs_gear or needs_run:
+            context, db_error = await fetch_player_context(
+                user,
+                player=needs_player or needs_class,
+                equipment=needs_gear,
+                run=needs_run,
+            )
             if db_error:
-                dblogger.exception(f"Error fetching player for user {user.id}")
+                dblogger.exception(f"Error fetching player context for user {user.id}")
                 await send_error("An error occurred while accessing the database. Please try again later.")
                 return None
-                
-        equipment = None
-        if needs_gear:
-            equipment, armor_error = await fetch_equipment(user)
-            if armor_error:
-                dblogger.exception(f"Error fetching armor for user {user.id}")
-                await send_error("An error occurred while accessing the database. Please try again later.")
-                return None
-                
-        run = None
-        if needs_run:
-            run, run_error = await fetchrun(user)
-            if run_error:
-                dblogger.exception(f"Error fetching run for user {user.id}")
-                await send_error("An error occurred while accessing the database. Please try again later.")
-                return None
-                
+
+        player = context.get('player')
+        equipment = context.get('equipment')
+        run = context.get('run')
+
         inject = {}
         if needs_user:
             inject['user'] = user
@@ -193,44 +191,34 @@ def with_player_context(func):
     return wrapper
 
 @db_exception_handler
-async def update_xp(
+async def update(
     user: discord.User,
-    xp: int,
-    levelup: int = 0,
-    *,
-    conn: asyncpg.Connection | None = None
+    **kwargs
 ):
+    conn = kwargs.get('conn')
     if conn is None:
         raise RuntimeError("Database connection was not provided.")
-    await conn.execute('''
-        UPDATE runs
-        SET xp = $2
-        WHERE user_id = $1;
-    ''', user.id, xp)
 
-    if levelup > 0:
+    if 'xp' in kwargs:
+        await conn.execute('''
+            UPDATE runs
+            SET xp = $2
+            WHERE user_id = $1;
+        ''', user.id, kwargs['xp'])
+
+    if kwargs.get('levelup', 0) > 0:
         await conn.execute('''
             UPDATE runs
             SET run_level = run_level + $2
             WHERE user_id = $1;
-        ''', user.id, levelup)
+        ''', user.id, kwargs['levelup'])
 
-    return None
-
-@db_exception_handler
-async def update_relic(
-    user: discord.User,
-    relic: int,
-    *,
-    conn: asyncpg.Connection | None = None
-):
-    if conn is None:
-        raise RuntimeError("Database connection was not provided.")
-    await conn.execute('''
-        UPDATE players
-        SET relic = relic + $1
-        WHERE user_id = $2;
-    ''', user.id, relic)
+    if 'relic' in kwargs:
+        await conn.execute('''
+            UPDATE players
+            SET relic = relic + $1
+            WHERE user_id = $2;
+        ''', kwargs['relic'], user.id)
 
     return None
 
@@ -252,18 +240,6 @@ async def startrun(
         RETURNING *;
     ''', user.id, hp)
     return response
-
-@db_exception_handler
-async def fetchrun(
-    user: discord.User,
-    *,
-    conn: asyncpg.Connection | None = None
-):
-    if conn is None:
-        raise RuntimeError("Database connection was not provided.")
-    run = await conn.fetchrow('SELECT * FROM runs WHERE user_id = $1', user.id)
-
-    return run
 
 @db_exception_handler
 async def endrun(
