@@ -1,7 +1,7 @@
 from dataclasses import dataclass, field
 from collections import defaultdict
 from typing import Callable
-from lib import roomgen
+from core.lib import roomgen
 import discord
 from core.ui import run_ui
 

@@ -2,8 +2,8 @@ import random
 
 import math
 
-from db import *
-from log import botlogger, dblogger
+from core.lib.db import *
+from core.lib.log import botlogger, dblogger
 from core.data.cards import *
 
 CARD_DROPRATE: dict[int, list[int]] = {
