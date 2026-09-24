@@ -1,9 +1,8 @@
 import asyncpg
-import json
-import inspect
 from functools import wraps
 from core.lib.log import dblogger
 import discord
+from discord.ext import commands
 import enum
 
 class GearTier(enum.IntEnum):
@@ -25,7 +24,7 @@ async def init_db(conn: asyncpg.Connection):
 dbpool: asyncpg.Pool | None = None
 def db_exception_handler(func):
     @wraps(func)
-    async def wrapper(user: discord.User, *args, **kwargs):
+    async def wrapper(user: discord.User | discord.Member, *args, **kwargs):
         try:
             if dbpool is None:
                 raise RuntimeError("Database pool has not been initialized.")
@@ -76,123 +75,69 @@ async def set_class(
     ''', class_name, user.id)
 
 @db_exception_handler
-async def fetch_player_context(
-    user: discord.User,
+async def fetch_player(
+    user: discord.User | discord.Member,
     *,
-    player: bool = False,
-    equipment: bool = False,
-    run: bool = False,
-    conn: asyncpg.Connection | None = None
+    conn: asyncpg.Connection | None = None,
 ):
-    """Return (context, db_error), fetching only requested keys in one connection.
-
-    Missing player/run rows are None; missing equipment is an empty dict.
-    """
     if conn is None:
         raise RuntimeError("Database connection was not provided.")
+    return await conn.fetchrow(
+        'SELECT * FROM players WHERE user_id = $1', user.id
+    )
 
-    context = {}
-    if player:
-        context['player'] = await conn.fetchrow(
-            'SELECT * FROM players WHERE user_id = $1', user.id
+
+@db_exception_handler
+async def fetch_run(
+    user: discord.User | discord.Member,
+    *,
+    conn: asyncpg.Connection | None = None,
+):
+    if conn is None:
+        raise RuntimeError("Database connection was not provided.")
+    return await conn.fetchrow(
+        'SELECT * FROM runs WHERE user_id = $1', user.id
+    )
+
+
+@db_exception_handler
+async def fetch_equipment(
+    user: discord.User | discord.Member,
+    *,
+    conn: asyncpg.Connection | None = None,
+):
+    if conn is None:
+        raise RuntimeError("Database connection was not provided.")
+    records = await conn.fetch('''
+        SELECT i.*
+        FROM run_equipment e
+        JOIN run_inventory i ON i.instance_id IN (
+            e.armor_instance_id,
+            e.weapon_instance_id,
+            e.secondary_instance_id
         )
-    if equipment:
-        records = await conn.fetch('''
-            SELECT i.* 
-            FROM run_equipment e
-            JOIN run_inventory i ON i.instance_id IN (
-                e.armor_instance_id, 
-                e.weapon_instance_id, 
-                e.secondary_instance_id
-            )
-            WHERE e.user_id = $1
-        ''', user.id)
-        context['equipment'] = {record['slot']: record for record in records}
-    if run:
-        context['run'] = await conn.fetchrow(
-            'SELECT * FROM runs WHERE user_id = $1', user.id
-        )
-    return context
+        WHERE e.user_id = $1
+    ''', user.id)
+    return {record['slot']: record for record in records}
 
-def with_player_context(func):
-    @wraps(func)
-    async def wrapper(*args, **kwargs):
-        # check if the user object exists
-        user: discord.User | discord.Member | None = kwargs.get('user')
-        ctx_or_interaction = None
-        if not user:
-            for arg in args:
-                if isinstance(arg, (discord.User, discord.Member)):
-                    user = arg
-                    break
-                elif hasattr(arg, 'author') and isinstance(getattr(arg, 'author'), (discord.User, discord.Member)):
-                    user = arg.author
-                    ctx_or_interaction = arg
-                    break
-                elif hasattr(arg, 'user') and isinstance(getattr(arg, 'user'), (discord.User, discord.Member)):
-                    user = arg.user
-                    ctx_or_interaction = arg
-                    break
-                    
-        if not user:
-            # fallback if user object doesnt exist
-            return await func(*args, **kwargs) if inspect.iscoroutinefunction(func) else func(*args, **kwargs)
 
-        sig = inspect.signature(func)
-        needs_user = 'user' in sig.parameters
-        needs_player = 'player' in sig.parameters
-        needs_gear = 'equipment' in sig.parameters
-        needs_class = 'class_name' in sig.parameters
-        needs_run = 'run' in sig.parameters
-        
-        async def send_error(msg):
-            if ctx_or_interaction:
-                if hasattr(ctx_or_interaction, 'send'):
-                    await ctx_or_interaction.send(msg)
-                elif hasattr(ctx_or_interaction, 'response') and hasattr(ctx_or_interaction.response, 'send_message'):
-                    if not ctx_or_interaction.response.is_done():
-                        await ctx_or_interaction.response.send_message(msg, ephemeral=True) 
+def requires_player():
+    async def predicate(ctx):
+        player, db_error = await fetch_player(ctx.author)
+        if db_error:
+            await ctx.send("An error occurred while accessing the database. Please try again later.")
+            return False
+        if player is None:
+            await ctx.send("You don't have a character yet. Use `!start` first.")
+            return False
+        ctx.player = player
+        return True
 
-        context = {}
-        if needs_player or needs_class or needs_gear or needs_run:
-            context, db_error = await fetch_player_context(
-                user,
-                player=needs_player or needs_class,
-                equipment=needs_gear,
-                run=needs_run,
-            )
-            if db_error:
-                dblogger.exception(f"Error fetching player context for user {user.id}")
-                await send_error("An error occurred while accessing the database. Please try again later.")
-                return None
-
-        player = context.get('player')
-        equipment = context.get('equipment')
-        run = context.get('run')
-
-        inject = {}
-        if needs_user:
-            inject['user'] = user
-        if needs_player: 
-            inject['player'] = player
-        if needs_gear: 
-            inject['equipment'] = equipment
-        if needs_class:
-            inject['class_name'] = player['class'] if player else None
-        if needs_run:
-            inject['run'] = run
-            
-        final_kwargs = {**inject, **kwargs}
-        
-        if inspect.iscoroutinefunction(func):
-            return await func(*args, **final_kwargs)
-        return func(*args, **final_kwargs)
-        
-    return wrapper
+    return commands.check(predicate)
 
 @db_exception_handler
 async def update(
-    user: discord.User,
+    user: discord.User | discord.Member,
     **kwargs
 ):
     conn: asyncpg.Connection | None = kwargs.get('conn')
@@ -224,7 +169,7 @@ async def update(
 
 @db_exception_handler
 async def startrun(
-    user: discord.User,
+    user: discord.User | discord.Member,
     hp: int,
     *,
     conn: asyncpg.Connection | None = None

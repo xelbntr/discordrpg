@@ -2,9 +2,13 @@ import random
 
 import math
 
-from core.lib.db import *
-from core.lib.log import botlogger, dblogger
-from core.data.cards import *
+import asyncpg
+import discord
+
+from core.lib import db
+from core.lib.db import GearTier
+from core.lib.log import dblogger
+from core.data.cards import CARDS_BY_RARITY
 
 CARD_DROPRATE: dict[int, list[int]] = {
     0: [80, 19, 1, 0],
@@ -22,8 +26,7 @@ CARD_GUARANTEED: dict[int, GearTier] = {
 
 RARITIES: list[GearTier] = [GearTier.common, GearTier.rare, GearTier.legendary, GearTier.prismatic_i]
 
-@with_player_context
-def generate_card(run: asyncpg.Record, level: int) -> list[str]:
+def generate_card(level: int) -> list[str]:
     pulls: int = 2
 
     # Level 1–4: 80% Common, 19% Rare, 1% Legendary
@@ -48,7 +51,6 @@ def generate_card(run: asyncpg.Record, level: int) -> list[str]:
 
     return cards
 
-@with_player_context
 def on_gain_xp(run: asyncpg.Record, xp: int) -> tuple[int, int]:
     temp_xp: float = run['xp'] + xp
     level: int = run['run_level']
@@ -64,17 +66,21 @@ def on_gain_xp(run: asyncpg.Record, xp: int) -> tuple[int, int]:
 
     return level_increment, math.floor(temp_xp)
 
-@with_player_context
-async def on_death(user: discord.User, player: asyncpg.Record, equipment: asyncpg.Record, victory: bool) -> bool:
-    if not player:
-        # this should not happen
-        # if it triggers, there may be an issue with fetch_player_context or with_player_context
-        dblogger.error(f"Unable to kill player: Player not found. Userid {user.id}")
+async def on_death(user: discord.User | discord.Member, victory: bool) -> bool:
+    player, db_error = await db.fetch_player(user)
+    if db_error or player is None:
+        dblogger.error(f"Unable to kill player: Could not load player. Userid {user.id}")
         return False
 
-    dberror: bool = await endrun(user)
+    # Equipment must be read before deleting the run and its inventory.
+    equipment, db_error = await db.fetch_equipment(user)
+    if db_error:
+        dblogger.error(f"Unable to kill player: Could not load equipment. Userid {user.id}")
+        return False
 
-    if dberror:
+    _, db_error = await db.endrun(user)
+
+    if db_error:
         dblogger.error(f"Unable to kill player: Failed to update user database on death. Userid {user.id}.")
         return False
 
@@ -85,6 +91,8 @@ async def on_death(user: discord.User, player: asyncpg.Record, equipment: asyncp
         relic_gained += int((gear['tier'] * 50) * (1.2 if victory else 0.7))
         
     if relic_gained > 0:
-        await update(user, relic=relic_gained)
+        _, db_error = await db.update(user, relic=relic_gained)
+        if db_error:
+            return False
 
     return True
