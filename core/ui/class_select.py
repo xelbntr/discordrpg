@@ -10,8 +10,12 @@ class ClassSelect(discord.ui.Select):
         ]
         super().__init__(placeholder="Choose your class...", min_values=1, max_values=1, options=options)
 
-    @db.with_player_context
-    async def callback(self, interaction: discord.Interaction, player):
+    async def callback(self, interaction: discord.Interaction):
+        player, db_error = await db.fetch_player(interaction.user)
+        if db_error:
+            await interaction.response.send_message("Unable to load your character. Please try again later.", ephemeral=True)
+            return
+
         class_name = self.values[0]
         
         if player:

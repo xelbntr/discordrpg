@@ -1,7 +1,8 @@
 import discord
 from discord.ext import commands
-from core.ui.run_ui import RunConfirmationView, MainRunView
-from core.lib.db import *
+from core.ui.run_ui import RunConfirmationView, BaseRoomView
+from core.data.rooms import ROOMS
+from core.lib import db
 
 
 class Run(commands.Cog):
@@ -9,18 +10,19 @@ class Run(commands.Cog):
         self.bot = bot
 
     @commands.command()
-    @with_player_context
-    async def run(self, ctx, player, run):
-        if not player:
-            await ctx.send("You don't have a character yet. Use `!start` first.", ephemeral=True)
+    @db.requires_player()
+    async def run(self, ctx):
+        run, db_error = await db.fetch_run(ctx.author)
+        if db_error:
+            await ctx.send("Error fetching run data. Please try again later.")
             return
 
         if run:
-            main_run_embed = discord.Embed(
-                title="Run",
-                description="[Placeholder main run embed]"
-            )
-            view = MainRunView(ctx.author)
+            room_name = run["room_sequence"][run["current_room"]]
+            main_run_embed = ROOMS[room_name].embed(run)
+            mainRunView: type[BaseRoomView] = ROOMS[room_name].view
+
+            view: BaseRoomView = mainRunView(ctx.author)
             view.message = await ctx.send(embed=main_run_embed, view=view, ephemeral=True)
         else:
             view = RunConfirmationView(ctx.author)

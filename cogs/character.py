@@ -10,8 +10,12 @@ class Character(commands.Cog):
         self.bot = bot
 
     @commands.command()
-    @db.with_player_context
-    async def start(self, ctx, player):
+    async def start(self, ctx):
+        player, db_error = await db.fetch_player(ctx.author)
+        if db_error:
+            await ctx.send("Unable to load your character. Please try again later.")
+            return
+
         if player:
             await ctx.send(f"You already have a save file! Your current class is **{player['class']}**.")
             return
@@ -23,12 +27,9 @@ class Character(commands.Cog):
         await ctx.send(welcome_msg, view=view)
 
     @commands.command()
-    @db.with_player_context
-    async def profile(self, ctx, player):
-        if not player:
-            await ctx.send("You don't have a character yet. Use `!start` to create one!")
-            return
-
+    @db.requires_player()
+    async def profile(self, ctx):
+        player = ctx.player
         class_name = player['class']
         class_info = CLASSES.get(class_name, {})
         passive_name = class_info.get("base_passive", {}).get("name", "Unknown")
