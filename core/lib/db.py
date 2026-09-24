@@ -118,7 +118,7 @@ def with_player_context(func):
     @wraps(func)
     async def wrapper(*args, **kwargs):
         # check if the user object exists
-        user = kwargs.get('user')
+        user: discord.User | discord.Member | None = kwargs.get('user')
         ctx_or_interaction = None
         if not user:
             for arg in args:
@@ -195,7 +195,7 @@ async def update(
     user: discord.User,
     **kwargs
 ):
-    conn = kwargs.get('conn')
+    conn: asyncpg.Connection | None = kwargs.get('conn')
     if conn is None:
         raise RuntimeError("Database connection was not provided.")
 
