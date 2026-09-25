@@ -1,7 +1,10 @@
+from email import message
+
 import discord
 
 from core.lib import db
-from core.lib.run import generate_card, on_gain_xp, start_run
+from core.lib.log import botlogger
+from core.lib.run_lib import generate_card, on_gain_xp, start_run
 
 class RunConfirmationView(discord.ui.View):
     def __init__(self, original_user: discord.User | discord.Member):
@@ -51,12 +54,18 @@ class CardSelectionView(BaseRoomView):
 
         for idx, card in enumerate(cards):
             btn = discord.ui.Button(label=f"{card}", style=discord.ButtonStyle.primary, custom_id=f"take_card_{idx}")
-            btn.callback = self.make_callback()
+            btn.callback = self.make_callback(card)
             self.add_item(btn)
 
-    def make_callback(self):
+    def make_callback(self, card: str):
         async def card_callback(interaction: discord.Interaction):
-            # Saving the chosen card is not implemented in db.py yet.
+            _, dberror = await db.update(user=self.original_user, deck=card)
+
+            if dberror:
+                botlogger.error("Failed to claim new card due to database error.")
+                embed = discord.Embed(description="Failed to claim new card due to database error.")
+                await interaction.response.edit_message(embed=embed)
+                return
 
             if self.remaining_levels:
                 next_level = self.remaining_levels[0]
@@ -68,12 +77,13 @@ class CardSelectionView(BaseRoomView):
                 await interaction.response.edit_message(embed=embed, view=view)
             else:
                 # 3. No more level ups, proceed to the next room (Basecamp)
-                run, db_error = await db.fetch_run(self.original_user)
-                if db_error or not run:
+                data, db_error = await db.fetch(self.original_user, run=True)
+                if db_error or not data['run']:
                     await interaction.response.send_message("Error fetching run data.", ephemeral=True)
                     return
                 from core.data.rooms import ROOMS
 
+                run = data['run']
                 room = ROOMS["basecamp"]
                 view = room.view(self.original_user)
                 embed = room.embed(run)
@@ -89,11 +99,12 @@ class BasecampView(BaseRoomView):
 class BattleView(BaseRoomView):
     @discord.ui.button(label="Next", style=discord.ButtonStyle.green)
     async def next(self: "BattleView", interaction: discord.Interaction, _button: discord.ui.Button):
-        run, db_error = await db.fetch_run(self.original_user)
-        if db_error or not run:
+        data, db_error = await db.fetch(self.original_user, run=True)
+        if db_error or not data['run']:
             await interaction.response.send_message("Error fetching run data.", ephemeral=True)
             return
 
+        run = data['run']
         current_level = run['run_level']
         
         level_increment, xp = on_gain_xp(run, xp=100) # temp placeholder xp

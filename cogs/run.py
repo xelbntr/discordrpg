@@ -11,11 +11,12 @@ class Run(commands.Cog):
     @commands.command()
     @db.requires_player()
     async def run(self, ctx):
-        run, db_error = await db.fetch_run(ctx.author)
+        data, db_error = await db.fetch(ctx.author, run=True)
         if db_error:
             await ctx.send("Error fetching run data. Please try again later.")
             return
 
+        run = data['run']
         if run:
             room_name = run["room_sequence"][run["current_room"]]
             main_run_embed = ROOMS[room_name].embed(run)

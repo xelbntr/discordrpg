@@ -5,7 +5,6 @@ import math
 import asyncpg
 import discord
 
-from core.data.rooms import ROOMS_BY_FLOOR, ROOMS
 from core.lib import db
 from core.lib.db import GearTier
 from core.lib.log import dblogger, botlogger
@@ -37,8 +36,6 @@ async def _create_run(
     *,
     conn: asyncpg.Connection | None = None,
 ):
-    if conn is None:
-        raise RuntimeError("Database connection was not provided.")
     return await conn.fetchrow('''
         INSERT INTO runs (user_id, hp, rank_snapshot)
         SELECT $1, $2, rank
@@ -53,8 +50,10 @@ async def generate_rooms(
         rank: int,
         floor: int,
 ) -> bool:
+    from core.data.rooms import ROOMS_BY_FLOOR, ROOMS
+
     candidates = ROOMS_BY_FLOOR[floor]
-    run, dberror = await db.fetch_run(user=user)
+    _, dberror = await db.fetch(user=user, run=True)
 
     if dberror:
         botlogger.error(f"Unable to generate room due to a database issue.")
@@ -92,7 +91,8 @@ async def start_run(
 
     if run is None:
         # Fallback if creation returned no row (e.g. run already exists)
-        run, db_error = await db.fetch_run(interaction.user)
+        data, db_error = await db.fetch(interaction.user, run=True)
+        run = None if db_error else data['run']
         if db_error or run is None:
             dblogger.error(f"Unable to start run for {interaction.user.id}. run output:\n{run}")
             await interaction.response.edit_message(content="Error starting run.", view=None)
@@ -150,16 +150,13 @@ def on_gain_xp(run: asyncpg.Record, xp: int) -> tuple[int, int]:
     return level_increment, math.floor(temp_xp)
 
 async def on_death(user: discord.User | discord.Member, victory: bool) -> bool:
-    player, db_error = await db.fetch_player(user)
-    if db_error or player is None:
+    # Equipment must be read before deleting the run and its inventory.
+    data, db_error = await db.fetch(user, player=True, equipment=True)
+    if db_error or data['player'] is None:
         dblogger.error(f"Unable to kill player: Could not load player. Userid {user.id}")
         return False
 
-    # Equipment must be read before deleting the run and its inventory.
-    equipment, db_error = await db.fetch_equipment(user)
-    if db_error:
-        dblogger.error(f"Unable to kill player: Could not load equipment. Userid {user.id}")
-        return False
+    equipment = data['equipment']
 
     _, db_error = await db.endrun(user)
 

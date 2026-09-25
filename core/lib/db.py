@@ -29,6 +29,8 @@ def db_exception_handler(func):
             if dbpool is None:
                 raise RuntimeError("Database pool has not been initialized.")
             async with dbpool.acquire() as conn:
+                if conn is None:
+                    raise RuntimeError("Database connection was not provided.")
                 response = await func(user, *args, conn=conn, **kwargs)
                 return response, False
         except asyncpg.UndefinedTableError as e:
@@ -49,8 +51,6 @@ async def new_player(
     *,
     conn: asyncpg.Connection | None = None
 ):
-    if conn is None:
-        raise RuntimeError("Database connection was not provided.")
     response = await conn.fetchrow('''
         INSERT INTO players (user_id, class) 
         VALUES ($1, $2) 
@@ -66,8 +66,6 @@ async def set_class(
     *,
     conn: asyncpg.Connection | None = None
 ):
-    if conn is None:
-        raise RuntimeError("Database connection was not provided.")
     await conn.execute('''
         UPDATE players 
         SET class = $1 
@@ -75,78 +73,43 @@ async def set_class(
     ''', class_name, user.id)
 
 @db_exception_handler
-async def fetch_player(
+async def fetch(
     user: discord.User | discord.Member,
-    *,
-    conn: asyncpg.Connection | None = None,
+    **kwargs
 ):
-    if conn is None:
-        raise RuntimeError("Database connection was not provided.")
-    return await conn.fetchrow(
-        'SELECT * FROM players WHERE user_id = $1', user.id
-    )
+    conn: asyncpg.Connection | None = kwargs.get('conn')
 
-
-@db_exception_handler
-async def fetch_run(
-    user: discord.User | discord.Member,
-    *,
-    conn: asyncpg.Connection | None = None,
-):
-    if conn is None:
-        raise RuntimeError("Database connection was not provided.")
-    return await conn.fetchrow(
-        'SELECT * FROM runs WHERE user_id = $1', user.id
-    )
-
-
-@db_exception_handler
-async def fetch_equipment(
-    user: discord.User | discord.Member,
-    *,
-    conn: asyncpg.Connection | None = None,
-):
-    if conn is None:
-        raise RuntimeError("Database connection was not provided.")
-    records = await conn.fetch('''
-        SELECT i.*
-        FROM run_equipment e
-        JOIN run_inventory i ON i.instance_id IN (
-            e.armor_instance_id,
-            e.weapon_instance_id,
-            e.secondary_instance_id
+    data = {}
+    if 'player' in kwargs:
+        data['player'] = await conn.fetchrow(
+            'SELECT * FROM players WHERE user_id = $1', user.id
         )
-        WHERE e.user_id = $1
-    ''', user.id)
-    return {record['slot']: record for record in records}
-
-@db_exception_handler
-async def reset_floor(
-        user: discord.User | discord.Member,
-        *,
-        conn: asyncpg.Connection | None = None,
-):
-    if conn is None:
-        raise RuntimeError("Database connection was not provided.")
-
-    try:
-        await conn.execute('''
-            UPDATE runs
-            SET room_sequence = ARRAY[]::text[]
-            WHERE user_id = $1;
+    if 'run' in kwargs:
+        data['run'] = await conn.fetchrow(
+            'SELECT * FROM runs WHERE user_id = $1', user.id
+        )
+    if 'equipment' in kwargs:
+        records = await conn.fetch('''
+            SELECT i.*
+            FROM run_equipment e
+            JOIN run_inventory i ON i.instance_id IN (
+                e.armor_instance_id,
+                e.weapon_instance_id,
+                e.secondary_instance_id
+            )
+            WHERE e.user_id = $1
         ''', user.id)
-    except Exception as e:
-        dblogger.error(f"Failed to reset floor. UserID: {user.id}. Error:\n{e}")
-        return False
-    return True
+        data['equipment'] = {record['slot']: record for record in records}
+    return data
 
 # ONLY USE THESE ON COGS!!!
 def requires_player():
     async def predicate(ctx):
-        player, db_error = await fetch_player(ctx.author)
+        data, db_error = await fetch(ctx.author, player=True)
         if db_error:
             await ctx.send("An error occurred while accessing the database. Please try again later.")
             return False
+        player = data['player']
         if player is None:
             await ctx.send("You don't have a character yet. Use `!start` first.")
             return False
@@ -161,8 +124,6 @@ async def update(
     **kwargs
 ):
     conn: asyncpg.Connection | None = kwargs.get('conn')
-    if conn is None:
-        raise RuntimeError("Database connection was not provided.")
 
     if 'xp' in kwargs:
         await conn.execute('''
@@ -192,7 +153,32 @@ async def update(
             WHERE user_id = $1;
         ''', user.id, kwargs['room'])
 
+    if 'deck' in kwargs:
+        await conn.execute('''
+           UPDATE runs
+           SET deck = array_append(deck, $2)
+           WHERE user_id = $1;
+       ''', user.id, kwargs['deck'])
+
     return None
+
+@db_exception_handler
+async def reset_floor(
+        user: discord.User | discord.Member,
+        *,
+        conn: asyncpg.Connection | None = None,
+):
+
+    try:
+        await conn.execute('''
+                           UPDATE runs
+                           SET room_sequence = ARRAY[]::text[]
+                           WHERE user_id = $1;
+                           ''', user.id)
+    except Exception as e:
+        dblogger.error(f"Failed to reset floor. UserID: {user.id}. Error:\n{e}")
+        return False
+    return True
 
 @db_exception_handler
 async def endrun(
@@ -200,8 +186,6 @@ async def endrun(
     *,
     conn: asyncpg.Connection | None = None
 ):
-    if conn is None:
-        raise RuntimeError("Database connection was not provided.")
     await conn.fetchrow('DELETE FROM runs WHERE user_id = $1', user.id)
 
     return None
