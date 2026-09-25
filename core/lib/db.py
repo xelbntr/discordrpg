@@ -120,7 +120,27 @@ async def fetch_equipment(
     ''', user.id)
     return {record['slot']: record for record in records}
 
+@db_exception_handler
+async def reset_floor(
+        user: discord.User | discord.Member,
+        *,
+        conn: asyncpg.Connection | None = None,
+):
+    if conn is None:
+        raise RuntimeError("Database connection was not provided.")
 
+    try:
+        await conn.execute('''
+            UPDATE runs
+            SET room_sequence = ARRAY[]::text[]
+            WHERE user_id = $1;
+        ''', user.id)
+    except Exception as e:
+        dblogger.error(f"Failed to reset floor. UserID: {user.id}. Error:\n{e}")
+        return False
+    return True
+
+# ONLY USE THESE ON COGS!!!
 def requires_player():
     async def predicate(ctx):
         player, db_error = await fetch_player(ctx.author)
@@ -161,9 +181,16 @@ async def update(
     if 'relic' in kwargs:
         await conn.execute('''
             UPDATE players
-            SET relic = relic + $1
-            WHERE user_id = $2;
-        ''', kwargs['relic'], user.id)
+            SET relic = relic + $2
+            WHERE user_id = $1;
+        ''', user.id, kwargs['relic'])
+
+    if 'room' in kwargs:
+        await conn.execute('''
+            UPDATE runs
+            SET room_sequence = array_append(room_sequence, $2)
+            WHERE user_id = $1;
+        ''', user.id, kwargs['room'])
 
     return None
 

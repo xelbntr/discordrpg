@@ -8,7 +8,7 @@ import discord
 from core.data.rooms import ROOMS_BY_FLOOR, ROOMS
 from core.lib import db
 from core.lib.db import GearTier
-from core.lib.log import dblogger
+from core.lib.log import dblogger, botlogger
 from core.data.cards import CARDS_BY_RARITY
 
 CARD_DROPRATE: dict[int, list[int]] = {
@@ -26,6 +26,9 @@ CARD_GUARANTEED: dict[int, GearTier] = {
 }
 
 RARITIES: list[GearTier] = [GearTier.common, GearTier.rare, GearTier.legendary, GearTier.prismatic_i]
+
+ROOMS_PER_FLOOR = 6
+MAX_FLOORS = 4
 
 @db.db_exception_handler
 async def _create_run(
@@ -45,11 +48,36 @@ async def _create_run(
         RETURNING *;
     ''', user.id, hp)
 
-async def generate_rooms(user, rank, floor):
-    candidate = ROOMS_BY_FLOOR[floor]
+async def generate_rooms(
+        user: discord.User | discord.Member,
+        rank: int,
+        floor: int,
+) -> bool:
+    candidates = ROOMS_BY_FLOOR[floor]
     run, dberror = await db.fetch_run(user=user)
 
+    if dberror:
+        botlogger.error(f"Unable to generate room due to a database issue.")
+        return False
 
+    if floor > 1:
+        if not await db.reset_floor(user=user):
+            botlogger.error(f"Unable to reset floor due to a database issue.")
+            return False
+
+    for i in range(ROOMS_PER_FLOOR):
+        if i == 0:
+            chosen_room = "basecamp"
+        elif i == ROOMS_PER_FLOOR-1:
+            if floor == MAX_FLOORS:
+                chosen_room = "finalboss"
+            else:
+                chosen_room = "boss"
+        else:
+            chosen_room = random.choices(candidates, weights=[ROOMS[room].weight for room in candidates], k=1)[0]
+        await db.update(user=user, room=chosen_room)
+
+    return True
 
 async def start_run(
     interaction: discord.Interaction,
