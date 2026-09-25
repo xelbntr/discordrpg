@@ -168,25 +168,6 @@ async def update(
     return None
 
 @db_exception_handler
-async def startrun(
-    user: discord.User | discord.Member,
-    hp: int,
-    *,
-    conn: asyncpg.Connection | None = None
-):
-    if conn is None:
-        raise RuntimeError("Database connection was not provided.")
-    response = await conn.fetchrow('''
-        INSERT INTO runs (user_id, hp, rank_snapshot)
-        SELECT $1, $2, rank
-        FROM players
-        WHERE user_id = $1
-        ON CONFLICT (user_id) DO NOTHING
-        RETURNING *;
-    ''', user.id, hp)
-    return response
-
-@db_exception_handler
 async def endrun(
     user: discord.User,
     *,

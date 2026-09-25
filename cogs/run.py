@@ -1,4 +1,3 @@
-import discord
 from discord.ext import commands
 from core.ui.run_ui import RunConfirmationView, BaseRoomView
 from core.data.rooms import ROOMS
@@ -20,9 +19,9 @@ class Run(commands.Cog):
         if run:
             room_name = run["room_sequence"][run["current_room"]]
             main_run_embed = ROOMS[room_name].embed(run)
-            mainRunView: type[BaseRoomView] = ROOMS[room_name].view
+            main_run_view: type[BaseRoomView] = ROOMS[room_name].view
 
-            view: BaseRoomView = mainRunView(ctx.author)
+            view: BaseRoomView = main_run_view(ctx.author)
             view.message = await ctx.send(embed=main_run_embed, view=view, ephemeral=True)
         else:
             view = RunConfirmationView(ctx.author)

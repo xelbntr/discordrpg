@@ -5,6 +5,7 @@ import math
 import asyncpg
 import discord
 
+from core.data.rooms import ROOMS_BY_FLOOR, ROOMS
 from core.lib import db
 from core.lib.db import GearTier
 from core.lib.log import dblogger
@@ -25,6 +26,60 @@ CARD_GUARANTEED: dict[int, GearTier] = {
 }
 
 RARITIES: list[GearTier] = [GearTier.common, GearTier.rare, GearTier.legendary, GearTier.prismatic_i]
+
+@db.db_exception_handler
+async def _create_run(
+    user: discord.User | discord.Member,
+    hp: int,
+    *,
+    conn: asyncpg.Connection | None = None,
+):
+    if conn is None:
+        raise RuntimeError("Database connection was not provided.")
+    return await conn.fetchrow('''
+        INSERT INTO runs (user_id, hp, rank_snapshot)
+        SELECT $1, $2, rank
+        FROM players
+        WHERE user_id = $1
+        ON CONFLICT (user_id) DO NOTHING
+        RETURNING *;
+    ''', user.id, hp)
+
+async def generate_rooms(user, rank, floor):
+    candidate = ROOMS_BY_FLOOR[floor]
+    run, dberror = await db.fetch_run(user=user)
+
+
+
+async def start_run(
+    interaction: discord.Interaction,
+    confirmation_view: discord.ui.View,
+    hp: int = 100,
+) -> None:
+    run, db_error = await _create_run(interaction.user, hp)
+
+    if db_error:
+        await interaction.response.send_message("Error starting run.", ephemeral=True)
+        return
+
+    if run is None:
+        # Fallback if creation returned no row (e.g. run already exists)
+        run, db_error = await db.fetch_run(interaction.user)
+        if db_error or run is None:
+            dblogger.error(f"Unable to start run for {interaction.user.id}. run output:\n{run}")
+            await interaction.response.edit_message(content="Error starting run.", view=None)
+            confirmation_view.stop()
+            return
+
+    from core.data.rooms import ROOMS
+
+    room_name = run["room_sequence"][run["current_room"]]
+    room = ROOMS[room_name]
+    main_run_embed = room.embed(run)
+    view = room.view(interaction.user)
+    await interaction.response.edit_message(content=None, embed=main_run_embed, view=view)
+    confirmation_view.stop()
+
 
 def generate_card(level: int) -> list[str]:
     pulls: int = 2

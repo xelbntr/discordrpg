@@ -1,8 +1,7 @@
 import discord
 
 from core.lib import db
-from core.lib.run import generate_card, on_gain_xp
-from core.lib.log import dblogger
+from core.lib.run import generate_card, on_gain_xp, start_run
 
 class RunConfirmationView(discord.ui.View):
     def __init__(self, original_user: discord.User | discord.Member):
@@ -24,29 +23,7 @@ class RunConfirmationView(discord.ui.View):
 
     @discord.ui.button(label="Yes", style=discord.ButtonStyle.green)
     async def confirm_run(self: "RunConfirmationView", interaction: discord.Interaction, _button: discord.ui.Button):
-        run, db_error = await db.startrun(interaction.user, 0)
-
-        if db_error:
-            await interaction.response.send_message("Error starting run.", ephemeral=True)
-            return
-
-        if run is None:
-            # Fallback if startrun failed (e.g. run already exists)
-            run, db_error = await db.fetch_run(interaction.user)
-            if db_error or run is None:
-                dblogger.error(f"Unable to start run for {interaction.user.id}. run output:\n{run}")
-                await interaction.response.edit_message(content="Error starting run. Do you have a character?", view=None)
-                self.stop()
-                return
-
-        from core.data.rooms import ROOMS
-
-        room_name = run["room_sequence"][run["current_room"]]
-        room = ROOMS[room_name]
-        main_run_embed = room.embed(run)
-        view = room.view(self.original_user)
-        await interaction.response.edit_message(content=None, embed=main_run_embed, view=view)
-        self.stop()
+        await start_run(interaction, self)
 
     @discord.ui.button(label="No", style=discord.ButtonStyle.red)
     async def cancel_run(self: "RunConfirmationView", interaction: discord.Interaction, _button: discord.ui.Button):
