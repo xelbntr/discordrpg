@@ -32,16 +32,16 @@ def db_exception_handler(func):
                 if conn is None:
                     raise RuntimeError("Database connection was not provided.")
                 response = await func(user, *args, conn=conn, **kwargs)
-                return response, False
+                return response
         except asyncpg.UndefinedTableError as e:
             dblogger.exception(f"Missing DB table. UserID: {user.id}. Error: {e}")
-            return None, True
+            raise
         except asyncpg.UndefinedColumnError as e:
             dblogger.exception(f"Missing DB column. UserID: {user.id}. Error: {e}")
-            return None, True
+            raise
         except Exception as e:
             dblogger.exception(f"DB error occurred. UserID: {user.id}. Error: {e}")
-            return None, True
+            raise
     return wrapper
 
 @db_exception_handler
@@ -105,10 +105,7 @@ async def fetch(
 # ONLY USE THESE ON COGS!!!
 def requires_player():
     async def predicate(ctx):
-        data, db_error = await fetch(ctx.author, player=True)
-        if db_error:
-            await ctx.send("An error occurred while accessing the database. Please try again later.")
-            return False
+        data = await fetch(ctx.author, player=True)
         player = data['player']
         if player is None:
             await ctx.send("You don't have a character yet. Use `!start` first.")
@@ -118,49 +115,47 @@ def requires_player():
 
     return commands.check(predicate)
 
+UPDATE_FIELDS = {
+    "xp": ("runs", "xp = {value}"),
+    "levelup": ("runs", "run_level = run_level + {value}"),
+    "relic": ("players", "relic = relic + {value}"),
+    "room": ("runs", "room_sequence = array_append(room_sequence, {value})"),
+    "deck": ("runs", "deck = array_append(deck, {value})"),
+    "advance_room": ("runs", "current_room = current_room + {value}"),
+}
+
+
 @db_exception_handler
 async def update(
     user: discord.User | discord.Member,
-    **kwargs
+    *,
+    conn: asyncpg.Connection | None = None,
+    **kwargs,
 ):
-    conn: asyncpg.Connection | None = kwargs.get('conn')
+    unknown = kwargs.keys() - UPDATE_FIELDS.keys()
+    if unknown:
+        raise ValueError(f"Unknown update fields: {', '.join(sorted(unknown))}")
 
-    if 'xp' in kwargs:
-        await conn.execute('''
-            UPDATE runs
-            SET xp = $2
-            WHERE user_id = $1;
-        ''', user.id, kwargs['xp'])
+    updates = {}
+    for field, value in kwargs.items():
+        if field == "levelup" and value <= 0:
+            continue
 
-    if kwargs.get('levelup', 0) > 0:
-        await conn.execute('''
-            UPDATE runs
-            SET run_level = run_level + $2
-            WHERE user_id = $1;
-        ''', user.id, kwargs['levelup'])
+        table, expression = UPDATE_FIELDS[field]
+        assignments, values = updates.setdefault(table, ([], [user.id]))
+        values.append(value)
+        assignments.append(expression.format(value=f"${len(values)}"))
 
-    if 'relic' in kwargs:
-        await conn.execute('''
-            UPDATE players
-            SET relic = relic + $2
-            WHERE user_id = $1;
-        ''', user.id, kwargs['relic'])
+    if not updates:
+        return None
 
-    if 'room' in kwargs:
-        await conn.execute('''
-            UPDATE runs
-            SET room_sequence = array_append(room_sequence, $2)
-            WHERE user_id = $1;
-        ''', user.id, kwargs['room'])
-
-    if 'deck' in kwargs:
-        await conn.execute('''
-           UPDATE runs
-           SET deck = array_append(deck, $2)
-           WHERE user_id = $1;
-       ''', user.id, kwargs['deck'])
-
-    return None
+    async with conn.transaction():
+        for table, (assignments, values) in updates.items():
+            query = (
+                f"UPDATE {table} SET {', '.join(assignments)} "
+                "WHERE user_id = $1"
+            )
+            await conn.execute(query, *values)
 
 @db_exception_handler
 async def reset_floor(
@@ -169,15 +164,11 @@ async def reset_floor(
         conn: asyncpg.Connection | None = None,
 ):
 
-    try:
-        await conn.execute('''
+    await conn.execute('''
                            UPDATE runs
-                           SET room_sequence = ARRAY[]::text[]
+                           SET room_sequence = ARRAY[]::text[], current_room = 0
                            WHERE user_id = $1;
                            ''', user.id)
-    except Exception as e:
-        dblogger.error(f"Failed to reset floor. UserID: {user.id}. Error:\n{e}")
-        return False
     return True
 
 @db_exception_handler

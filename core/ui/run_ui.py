@@ -1,9 +1,6 @@
-from email import message
-
 import discord
 
 from core.lib import db
-from core.lib.log import botlogger
 from core.lib.run_lib import generate_card, on_gain_xp, start_run
 
 class RunConfirmationView(discord.ui.View):
@@ -46,6 +43,43 @@ class BaseRoomView(discord.ui.View):
         return True
 
 
+class MapSelectionView(BaseRoomView):
+    def __init__(self, original_user: discord.User | discord.Member, next_room):
+        super().__init__(original_user)
+        self.next_room = next_room
+
+    # --- DO NOT DELETE ---
+    # in the future, there will be up to three room selections per block, and
+    # it will have similar button generation mechanics to card selection view.
+    # either that or I change both so that unused buttons just get disabled
+    # instead of generating buttons per available room.
+
+    @discord.ui.button(label="Move", style=discord.ButtonStyle.green)
+    async def next(self: "MapSelectionView", interaction: discord.Interaction, _button: discord.ui.Button):
+        from core.data.rooms import ROOMS
+
+        data = await db.fetch(user=self.original_user, run=True)
+
+        if not data['run']:
+            await interaction.response.send_message("You don't have an active run.", ephemeral=True)
+            return
+
+        run = data['run']
+
+        next_index = run['current_room'] + 1
+        if not 0 <= run['current_room'] < next_index < len(run['room_sequence']):
+            await interaction.response.send_message("No next room on this floor.", ephemeral=True)
+            return
+
+        await db.update(user=self.original_user, advance_room=1)
+        run = dict(run)
+        run['current_room'] = next_index
+        room = ROOMS[run['room_sequence'][run['current_room']]]
+        embed = room.embed(run)
+        view = room.view(self.original_user)
+        await interaction.response.edit_message(embed=embed, view=view)
+
+
 class CardSelectionView(BaseRoomView):
     def __init__(self, original_user: discord.User | discord.Member, cards: list[str], remaining_levels: list[int]):
         super().__init__(original_user)
@@ -59,13 +93,7 @@ class CardSelectionView(BaseRoomView):
 
     def make_callback(self, card: str):
         async def card_callback(interaction: discord.Interaction):
-            _, dberror = await db.update(user=self.original_user, deck=card)
-
-            if dberror:
-                botlogger.error("Failed to claim new card due to database error.")
-                embed = discord.Embed(description="Failed to claim new card due to database error.")
-                await interaction.response.edit_message(embed=embed)
-                return
+            await db.update(user=self.original_user, deck=card)
 
             if self.remaining_levels:
                 next_level = self.remaining_levels[0]
@@ -77,9 +105,9 @@ class CardSelectionView(BaseRoomView):
                 await interaction.response.edit_message(embed=embed, view=view)
             else:
                 # 3. No more level ups, proceed to the next room (Basecamp)
-                data, db_error = await db.fetch(self.original_user, run=True)
-                if db_error or not data['run']:
-                    await interaction.response.send_message("Error fetching run data.", ephemeral=True)
+                data = await db.fetch(self.original_user, run=True)
+                if not data['run']:
+                    await interaction.response.send_message("You don't have an active run.", ephemeral=True)
                     return
                 from core.data.rooms import ROOMS
 
@@ -99,19 +127,18 @@ class BasecampView(BaseRoomView):
 class BattleView(BaseRoomView):
     @discord.ui.button(label="Next", style=discord.ButtonStyle.green)
     async def next(self: "BattleView", interaction: discord.Interaction, _button: discord.ui.Button):
-        data, db_error = await db.fetch(self.original_user, run=True)
-        if db_error or not data['run']:
-            await interaction.response.send_message("Error fetching run data.", ephemeral=True)
+        from core.data.rooms import ROOMS
+
+        data = await db.fetch(self.original_user, run=True)
+        if not data['run']:
+            await interaction.response.send_message("You don't have an active run.", ephemeral=True)
             return
 
         run = data['run']
         current_level = run['run_level']
         
         level_increment, xp = on_gain_xp(run, xp=100) # temp placeholder xp
-        _, db_error = await db.update(user=self.original_user, xp=xp, levelup=level_increment)
-        if db_error:
-            await interaction.response.send_message("Error updating run data.", ephemeral=True)
-            return
+        await db.update(user=self.original_user, xp=xp, levelup=level_increment)
         if level_increment > 0:
             levels_to_process = [current_level + i + 1 for i in range(level_increment)]
             
@@ -122,9 +149,7 @@ class BattleView(BaseRoomView):
             embed = discord.Embed(title=f"Level Up! (Level {first_level})", description="Choose a card:")
             await interaction.response.edit_message(embed=embed, view=view)
         else:
-            # move to next room; this is placeholder
             next_room_name = run["room_sequence"][run["current_room"]]
-            from core.data.rooms import ROOMS
 
             room = ROOMS[next_room_name]
             view = room.view(self.original_user)

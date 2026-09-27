@@ -1,5 +1,4 @@
-from collections.abc import Iterable, Mapping
-from pydoc import describe
+from collections.abc import Mapping
 from typing import Any
 
 import discord
@@ -15,28 +14,34 @@ class BaseRoomEmbed(discord.Embed):
         run: Mapping[str, Any],
         *,
         details: str | None = None,
-        monster: Mapping[str, Any] | None = None,
-        inventory: Iterable[str] | None = None,
     ):
         super().__init__(
             title=self.room_title,
             description=(details or self.room_description)[:4096],
             color=self.room_color,
         )
+        self.add_field(name="HP", value=str(run["hp"]))
+        self.add_field(name="XP", value=str(run["xp"]))
 
 
-class MapViewEmbed(discord.Embed):
-    def __init__(self, rooms: list[str], current_room: int):
+class MapSelectionEmbed(discord.Embed):
+    def __init__(
+            self,
+            floor: int,
+            rooms: list[str],
+            current_room: int
+    ):
         super().__init__(
             title="Map",
-            description="Choose a room to move to.",
+            description=f"Floor {floor}",
+            color=discord.Color.gold()
         )
 
-        for pos, room in enumerate(rooms, start=1):
+        for pos, room in enumerate(rooms):
             if pos == current_room:
-                self.add_field(value=f"**[{pos}] {room} <<<**")
+                self.add_field(name=f"Room {pos + 1}", value=f"**[{pos + 1}] {room} <<<**")
             else:
-                self.add_field(value=f"[{pos}] {room}")
+                self.add_field(name=f"Room {pos + 1}", value=f"[{pos + 1}] {room}")
 
 
 class BasecampEmbed(BaseRoomEmbed):
@@ -88,4 +93,3 @@ class BossEmbed(BattleEmbed):
 class FinalbossEmbed(BossEmbed):
     room_title = "Final Boss"
     room_description = "Your final challenge awaits."
-

@@ -11,11 +11,7 @@ class Character(commands.Cog):
 
     @commands.command()
     async def start(self, ctx):
-        data, db_error = await db.fetch(ctx.author, player=True)
-        if db_error:
-            await ctx.send("Unable to load your character. Please try again later.")
-            return
-
+        data = await db.fetch(ctx.author, player=True)
         player = data['player']
         if player:
             await ctx.send(f"You already have a save file! Your current class is **{player['class']}**.")

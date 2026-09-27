@@ -11,11 +11,7 @@ class ClassSelect(discord.ui.Select):
         super().__init__(placeholder="Choose your class...", min_values=1, max_values=1, options=options)
 
     async def callback(self, interaction: discord.Interaction):
-        data, db_error = await db.fetch(interaction.user, player=True)
-        if db_error:
-            await interaction.response.send_message("Unable to load your character. Please try again later.", ephemeral=True)
-            return
-
+        data = await db.fetch(interaction.user, player=True)
         player = data['player']
         class_name = self.values[0]
         
@@ -26,12 +22,8 @@ class ClassSelect(discord.ui.Select):
             self.view.stop()
             return
             
-        inserted, create_error = await db.new_player(interaction.user, class_name)
+        inserted = await db.new_player(interaction.user, class_name)
         
-        if create_error:
-            await interaction.response.send_message("An error occurred while creating your save file.", ephemeral=True)
-            return
-            
         if not inserted:
              await interaction.response.send_message("You already have a save file!", ephemeral=True)
              self.disabled = True

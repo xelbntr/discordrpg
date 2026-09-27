@@ -7,7 +7,7 @@ import discord
 
 from core.lib import db
 from core.lib.db import GearTier
-from core.lib.log import dblogger, botlogger
+from core.lib.log import dblogger
 from core.data.cards import CARDS_BY_RARITY
 
 CARD_DROPRATE: dict[int, list[int]] = {
@@ -37,8 +37,8 @@ async def _create_run(
     conn: asyncpg.Connection | None = None,
 ):
     return await conn.fetchrow('''
-        INSERT INTO runs (user_id, hp, rank_snapshot)
-        SELECT $1, $2, rank
+        INSERT INTO runs (user_id, hp, rank_snapshot, current_room)
+        SELECT $1, $2, rank, 0
         FROM players
         WHERE user_id = $1
         ON CONFLICT (user_id) DO NOTHING
@@ -53,16 +53,9 @@ async def generate_rooms(
     from core.data.rooms import ROOMS_BY_FLOOR, ROOMS
 
     candidates = ROOMS_BY_FLOOR[floor]
-    _, dberror = await db.fetch(user=user, run=True)
-
-    if dberror:
-        botlogger.error(f"Unable to generate room due to a database issue.")
-        return False
 
     if floor > 1:
-        if not await db.reset_floor(user=user):
-            botlogger.error(f"Unable to reset floor due to a database issue.")
-            return False
+        await db.reset_floor(user=user)
 
     for i in range(ROOMS_PER_FLOOR):
         if i == 0:
@@ -75,7 +68,6 @@ async def generate_rooms(
         else:
             chosen_room = random.choices(candidates, weights=[ROOMS[room].weight for room in candidates], k=1)[0]
         await db.update(user=user, room=chosen_room)
-
     return True
 
 async def start_run(
@@ -83,17 +75,13 @@ async def start_run(
     confirmation_view: discord.ui.View,
     hp: int = 100,
 ) -> None:
-    run, db_error = await _create_run(interaction.user, hp)
-
-    if db_error:
-        await interaction.response.send_message("Error starting run.", ephemeral=True)
-        return
+    run = await _create_run(interaction.user, hp)
 
     if run is None:
         # Fallback if creation returned no row (e.g. run already exists)
-        data, db_error = await db.fetch(interaction.user, run=True)
-        run = None if db_error else data['run']
-        if db_error or run is None:
+        data = await db.fetch(interaction.user, run=True)
+        run = data['run']
+        if run is None:
             dblogger.error(f"Unable to start run for {interaction.user.id}. run output:\n{run}")
             await interaction.response.edit_message(content="Error starting run.", view=None)
             confirmation_view.stop()
@@ -151,18 +139,14 @@ def on_gain_xp(run: asyncpg.Record, xp: int) -> tuple[int, int]:
 
 async def on_death(user: discord.User | discord.Member, victory: bool) -> bool:
     # Equipment must be read before deleting the run and its inventory.
-    data, db_error = await db.fetch(user, player=True, equipment=True)
-    if db_error or data['player'] is None:
+    data = await db.fetch(user, player=True, equipment=True)
+    if data['player'] is None:
         dblogger.error(f"Unable to kill player: Could not load player. Userid {user.id}")
         return False
 
     equipment = data['equipment']
 
-    _, db_error = await db.endrun(user)
-
-    if db_error:
-        dblogger.error(f"Unable to kill player: Failed to update user database on death. Userid {user.id}.")
-        return False
+    await db.endrun(user)
 
     relic_gained = 0
     for gear in equipment.values():
@@ -171,8 +155,5 @@ async def on_death(user: discord.User | discord.Member, victory: bool) -> bool:
         relic_gained += int((gear['tier'] * 50) * (1.2 if victory else 0.7))
         
     if relic_gained > 0:
-        _, db_error = await db.update(user, relic=relic_gained)
-        if db_error:
-            return False
-
+        await db.update(user, relic=relic_gained)
     return True
