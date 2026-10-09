@@ -1,0 +1,973 @@
+diff --git a/README.md b/README.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..a9222b39b6059d9e019d94bc9ad04e908d92d039
+--- /dev/null
++++ b/README.md
+@@ -0,0 +1,43 @@
++# DiscordRPG
++
++## Run transitions
++
++Apply `migrations/001_run_transitions.sql` to the existing PostgreSQL database
++before running this version. It adds saved floor, room completion, reward choices,
++and a state ID used to reject buttons from older screens. PostgreSQL 13 or newer
++is required for `gen_random_uuid()`.
++
++```sh
++psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f migrations/001_run_transitions.sql
++uv sync --locked
++uv run python main.py
++```
++
++Set `DATABASE_URL` and `DISCORD_TOKEN` in `.env`. This migration extends the
++existing game tables; it does not create a new database from scratch.
++
++Use `!start` to create a character, then `!run` and confirm Yes. Each floor has
++six rooms, starting at basecamp and ending with a boss (the final boss on floor
++four). Every room has a **Complete Room** placeholder button. Battle placeholders
++award 100 XP; other placeholders have no rewards yet. Level-ups offer cards before
++the map appears. The current catalog only contains common cards, so empty rarity
++pools fall back to available cards.
++
++**Move** enters the next room. After the boss, **Next Floor** generates the next
++floor and enters its basecamp. After the final boss, **Finish Run** closes the run
++through the existing victory/relic handling. No combat mechanics are implemented.
++
++Use `!run` again after closing a message or restarting the bot. It restores the
++room, pending card choices, map, or completion screen from saved state. Older
++messages cannot repeat rewards or move the player twice.
++
++To test manually, complete all six rooms on each of the four floors, select every
++offered card, and finish the run. Reopen `!run` at a room, a card selection, and a
++map to check resume behavior. Try the same action from two open `!run` messages;
++only the first should change the run.
++
++Run the transition tests with installed project dependencies:
++
++```sh
++uv run python -m unittest discover -s tests -v
++```
+diff --git a/cogs/run.py b/cogs/run.py
+index 264e8a2a8cca6bbfb1e3e031b7daf49acddaf6e9..3d40fdd935cdbe541486b294b3f830312b2ca6d2 100644
+--- a/cogs/run.py
++++ b/cogs/run.py
+@@ -1,6 +1,6 @@
+ from discord.ext import commands
+-from core.ui.run_ui import RunConfirmationView, BaseRoomView
+-from core.data.rooms import ROOMS
++from core.ui.run_ui import RunConfirmationView, run_screen
++from core.lib.run_lib import load_run
+ from core.lib import db
+ 
+ 
+@@ -11,18 +11,13 @@ class Run(commands.Cog):
+     @commands.command()
+     @db.requires_player()
+     async def run(self, ctx):
+-        data = await db.fetch(ctx.author, run=True)
+-        run = data['run']
++        run = await load_run(ctx.author)
+         if run:
+-            room_name = run["room_sequence"][run["current_room"]]
+-            main_run_embed = ROOMS[room_name].embed(run)
+-            main_run_view: type[BaseRoomView] = ROOMS[room_name].view
+-
+-            view: BaseRoomView = main_run_view(ctx.author)
+-            view.message = await ctx.send(embed=main_run_embed, view=view, ephemeral=True)
++            embed, view = run_screen(ctx.author, run)
++            await ctx.send(embed=embed, view=view)
+         else:
+             view = RunConfirmationView(ctx.author)
+-            view.message = await ctx.send("Start a run?", view=view, ephemeral=True)
++            view.message = await ctx.send("Start a run?", view=view)
+ 
+ async def setup(bot):
+     await bot.add_cog(Run(bot))
+diff --git a/core/lib/db.py b/core/lib/db.py
+index 670313957e69c91dce78096ee7bb279ecb0a1f44..bbf548f681385e28c920f2c900c7b9ea9a2d6d63 100644
+--- a/core/lib/db.py
++++ b/core/lib/db.py
+@@ -171,12 +171,59 @@ async def reset_floor(
+                            ''', user.id)
+     return True
+ 
++@db_exception_handler
++async def create_run(
++    user: discord.User | discord.Member,
++    hp: int,
++    *,
++    conn: asyncpg.Connection | None = None,
++):
++    return await conn.fetchrow('''
++        INSERT INTO runs (user_id, hp, rank_snapshot, current_room)
++        SELECT $1, $2, rank, 0
++        FROM players
++        WHERE user_id = $1
++        ON CONFLICT (user_id) DO NOTHING
++        RETURNING *;
++    ''', user.id, hp)
++
++RUN_STATE_FIELDS = {
++    "xp", "run_level", "deck", "current_floor", "current_room",
++    "room_sequence", "room_completed", "pending_levels", "card_choices",
++}
++
++@db_exception_handler
++async def update_run_state(
++    user: discord.User | discord.Member,
++    state_id,
++    *,
++    conn: asyncpg.Connection | None = None,
++    **kwargs,
++):
++    unknown = kwargs.keys() - RUN_STATE_FIELDS
++    if unknown:
++        raise ValueError(f"Unknown run fields: {', '.join(sorted(unknown))}")
++
++    assignments = ["state_id = gen_random_uuid()"]
++    values = [user.id, state_id]
++    for field, value in kwargs.items():
++        values.append(value)
++        assignments.append(f"{field} = ${len(values)}")
++
++    return await conn.fetchrow(
++        f"UPDATE runs SET {', '.join(assignments)} "
++        "WHERE user_id = $1 AND state_id = $2 RETURNING *",
++        *values,
++    )
++
+ @db_exception_handler
+ async def endrun(
+     user: discord.User,
++    state_id=None,
+     *,
+     conn: asyncpg.Connection | None = None
+ ):
+-    await conn.fetchrow('DELETE FROM runs WHERE user_id = $1', user.id)
+-
+-    return None
++    return await conn.fetchrow(
++        'DELETE FROM runs WHERE user_id = $1 AND ($2::uuid IS NULL OR state_id = $2) RETURNING *',
++        user.id, state_id,
++    )
+diff --git a/core/lib/run_lib.py b/core/lib/run_lib.py
+index 126ea3096df3f263602b70965e275717e216bd97..4cf837b62d426569dda2efd3dc48270e55a01bda 100644
+--- a/core/lib/run_lib.py
++++ b/core/lib/run_lib.py
+@@ -29,34 +29,20 @@ RARITIES: list[GearTier] = [GearTier.common, GearTier.rare, GearTier.legendary,
+ ROOMS_PER_FLOOR = 6
+ MAX_FLOORS = 4
+ 
+-@db.db_exception_handler
+-async def _create_run(
+-    user: discord.User | discord.Member,
+-    hp: int,
+-    *,
+-    conn: asyncpg.Connection | None = None,
+-):
+-    return await conn.fetchrow('''
+-        INSERT INTO runs (user_id, hp, rank_snapshot, current_room)
+-        SELECT $1, $2, rank, 0
+-        FROM players
+-        WHERE user_id = $1
+-        ON CONFLICT (user_id) DO NOTHING
+-        RETURNING *;
+-    ''', user.id, hp)
+-
+ async def generate_rooms(
+         user: discord.User | discord.Member,
+         rank: int,
+         floor: int,
+-) -> bool:
++        *,
++        state_id,
++):
+     from core.data.rooms import ROOMS_BY_FLOOR, ROOMS
+ 
+-    candidates = ROOMS_BY_FLOOR[floor]
+-
+-    if floor > 1:
+-        await db.reset_floor(user=user)
++    if not 1 <= floor <= MAX_FLOORS:
++        raise ValueError(f"Invalid floor: {floor}")
+ 
++    candidates = [room for room in ROOMS_BY_FLOOR[floor] if ROOMS[room].weight > 0]
++    rooms = []
+     for i in range(ROOMS_PER_FLOOR):
+         if i == 0:
+             chosen_room = "basecamp"
+@@ -67,35 +53,102 @@ async def generate_rooms(
+                 chosen_room = "boss"
+         else:
+             chosen_room = random.choices(candidates, weights=[ROOMS[room].weight for room in candidates], k=1)[0]
+-        await db.update(user=user, room=chosen_room)
+-    return True
++        rooms.append(chosen_room)
++
++    return await db.update_run_state(
++        user, state_id,
++        current_floor=floor, current_room=0, room_sequence=rooms,
++        room_completed=False, pending_levels=[], card_choices=[],
++    )
++
++async def load_run(user: discord.User | discord.Member):
++    data = await db.fetch(user, run=True)
++    run = data['run']
++    if run and not run['room_sequence']:
++        generated_run = await generate_rooms(
++            user, run['rank_snapshot'], run['current_floor'], state_id=run['state_id'],
++        )
++        if generated_run is None:
++            data = await db.fetch(user, run=True)
++            return data['run']
++        run = generated_run
++    return run
+ 
+ async def start_run(
+     interaction: discord.Interaction,
+     confirmation_view: discord.ui.View,
+     hp: int = 100,
+ ) -> None:
+-    run = await _create_run(interaction.user, hp)
++    await interaction.response.defer()
++    run = await db.create_run(interaction.user, hp)
+ 
+     if run is None:
+-        # Fallback if creation returned no row (e.g. run already exists)
+-        data = await db.fetch(interaction.user, run=True)
+-        run = data['run']
++        run = await load_run(interaction.user)
+         if run is None:
+             dblogger.error(f"Unable to start run for {interaction.user.id}. run output:\n{run}")
+-            await interaction.response.edit_message(content="Error starting run.", view=None)
++            await interaction.edit_original_response(content="Error starting run.", view=None)
+             confirmation_view.stop()
+             return
+ 
+-    from core.data.rooms import ROOMS
++    if not run['room_sequence']:
++        run = await generate_rooms(
++            interaction.user, run['rank_snapshot'], 1, state_id=run['state_id'],
++        )
++        if run is None:
++            run = await load_run(interaction.user)
+ 
+-    room_name = run["room_sequence"][run["current_room"]]
+-    room = ROOMS[room_name]
+-    main_run_embed = room.embed(run)
+-    view = room.view(interaction.user)
+-    await interaction.response.edit_message(content=None, embed=main_run_embed, view=view)
++    from core.ui.run_ui import show_run
++
++    await show_run(interaction, run)
+     confirmation_view.stop()
+ 
++async def complete_room(user, run, xp: int = 0):
++    if run['room_completed']:
++        return None
++
++    level_increment, remaining_xp = on_gain_xp(run, xp)
++    levels = list(range(run['run_level'] + 1, run['run_level'] + level_increment + 1))
++    cards = generate_card(levels[0]) if levels else []
++    return await db.update_run_state(
++        user, run['state_id'], xp=remaining_xp,
++        run_level=run['run_level'] + level_increment,
++        room_completed=True, pending_levels=levels, card_choices=cards,
++    )
++
++async def choose_card(user, run, card: str):
++    if not run['pending_levels'] or card not in run['card_choices']:
++        return None
++
++    remaining_levels = list(run['pending_levels'][1:])
++    next_cards = generate_card(remaining_levels[0]) if remaining_levels else []
++    return await db.update_run_state(
++        user, run['state_id'], deck=list(run['deck'] or []) + [card],
++        pending_levels=remaining_levels, card_choices=next_cards,
++    )
++
++async def move_room(user, run):
++    if not run['room_completed'] or run['pending_levels']:
++        return None
++
++    next_index = run['current_room'] + 1
++    if next_index < len(run['room_sequence']):
++        return await db.update_run_state(
++            user, run['state_id'], current_room=next_index, room_completed=False,
++        )
++    if run['current_floor'] < MAX_FLOORS:
++        return await generate_rooms(
++            user, run['rank_snapshot'], run['current_floor'] + 1,
++            state_id=run['state_id'],
++        )
++    return None
++
++def run_finished(run) -> bool:
++    return (
++        run['room_completed'] and not run['pending_levels']
++        and run['current_floor'] == MAX_FLOORS
++        and run['current_room'] == len(run['room_sequence']) - 1
++    )
++
+ 
+ def generate_card(level: int) -> list[str]:
+     pulls: int = 2
+@@ -116,7 +169,12 @@ def generate_card(level: int) -> list[str]:
+             
+         available_cards: list[str] = [c for c in CARDS_BY_RARITY[rolled_rarity] if c not in cards]
+         if not available_cards:
+-            available_cards = CARDS_BY_RARITY[rolled_rarity]
++            available_cards = list(CARDS_BY_RARITY[rolled_rarity])
++        if not available_cards:
++            catalog = [card for pool in CARDS_BY_RARITY.values() for card in pool]
++            available_cards = [card for card in catalog if card not in cards] or catalog
++        if not available_cards:
++            raise ValueError("No cards are available for rewards.")
+             
+         cards.append(random.choice(available_cards))
+ 
+@@ -137,7 +195,7 @@ def on_gain_xp(run: asyncpg.Record, xp: int) -> tuple[int, int]:
+ 
+     return level_increment, math.floor(temp_xp)
+ 
+-async def on_death(user: discord.User | discord.Member, victory: bool) -> bool:
++async def on_death(user: discord.User | discord.Member, victory: bool, state_id=None) -> bool:
+     # Equipment must be read before deleting the run and its inventory.
+     data = await db.fetch(user, player=True, equipment=True)
+     if data['player'] is None:
+@@ -146,7 +204,9 @@ async def on_death(user: discord.User | discord.Member, victory: bool) -> bool:
+ 
+     equipment = data['equipment']
+ 
+-    await db.endrun(user)
++    ended_run = await db.endrun(user, state_id=state_id)
++    if ended_run is None:
++        return False
+ 
+     relic_gained = 0
+     for gear in equipment.values():
+diff --git a/core/ui/run_embed.py b/core/ui/run_embed.py
+index 979a6d4ffcd6fec42b85f5d38eca83e9b67459b3..c568c192f0abd024d0c21749ee5fa75444740d85 100644
+--- a/core/ui/run_embed.py
++++ b/core/ui/run_embed.py
+@@ -22,6 +22,8 @@ class BaseRoomEmbed(discord.Embed):
+         )
+         self.add_field(name="HP", value=str(run["hp"]))
+         self.add_field(name="XP", value=str(run["xp"]))
++        self.add_field(name="Level", value=str(run["run_level"]))
++        self.set_footer(text=f"Floor {run['current_floor']} • Room {run['current_room'] + 1} • Placeholder: Complete Room to continue")
+ 
+ 
+ class MapSelectionEmbed(discord.Embed):
+diff --git a/core/ui/run_ui.py b/core/ui/run_ui.py
+index 66e0fa7e8d110276b1ede4c31895b13d36fb597c..666be13484c7f9faee4219a8d6caa7da25e85cb4 100644
+--- a/core/ui/run_ui.py
++++ b/core/ui/run_ui.py
+@@ -1,7 +1,11 @@
+ import discord
+ 
+-from core.lib import db
+-from core.lib.run_lib import generate_card, on_gain_xp, start_run
++from core.lib.run_lib import (
++    MAX_FLOORS, choose_card, complete_room, move_room, on_death,
++    run_finished, start_run,
++)
++from core.ui.run_embed import MapSelectionEmbed
++
+ 
+ class RunConfirmationView(discord.ui.View):
+     def __init__(self, original_user: discord.User | discord.Member):
+@@ -11,6 +15,7 @@ class RunConfirmationView(discord.ui.View):
+ 
+     async def interaction_check(self, interaction: discord.Interaction) -> bool:
+         if interaction.user != self.original_user:
++            await interaction.response.send_message("This run belongs to another player.", ephemeral=True)
+             return False
+         return True
+ 
+@@ -22,31 +27,42 @@ class RunConfirmationView(discord.ui.View):
+             await self.message.edit(view=self)
+ 
+     @discord.ui.button(label="Yes", style=discord.ButtonStyle.green)
+-    async def confirm_run(self: "RunConfirmationView", interaction: discord.Interaction, _button: discord.ui.Button):
++    async def confirm_run(self, interaction: discord.Interaction, _button: discord.ui.Button):
+         await start_run(interaction, self)
+ 
+     @discord.ui.button(label="No", style=discord.ButtonStyle.red)
+-    async def cancel_run(self: "RunConfirmationView", interaction: discord.Interaction, _button: discord.ui.Button):
++    async def cancel_run(self, interaction: discord.Interaction, _button: discord.ui.Button):
+         await interaction.response.edit_message(content="Run cancelled.", view=None)
+         self.stop()
+ 
+ 
+ class BaseRoomView(discord.ui.View):
+-    def __init__(self, original_user: discord.User | discord.Member):
++    def __init__(self, original_user: discord.User | discord.Member, run):
+         super().__init__(timeout=None)
+         self.original_user = original_user
+-        self.message: discord.Message | None = None
++        self.run = run
+ 
+     async def interaction_check(self, interaction: discord.Interaction) -> bool:
+         if interaction.user != self.original_user:
++            await interaction.response.send_message("This run belongs to another player.", ephemeral=True)
++            return False
++        if self.is_finished():
++            await interaction.response.send_message("This screen has expired. Use `!run` to resume.", ephemeral=True)
+             return False
+         return True
+ 
++    async def show_result(self, interaction: discord.Interaction, run):
++        if run is not None:
++            self.stop()
++        await show_run(interaction, run)
++
+ 
+ class MapSelectionView(BaseRoomView):
+-    def __init__(self, original_user: discord.User | discord.Member, next_room):
+-        super().__init__(original_user)
++    def __init__(self, original_user: discord.User | discord.Member, run, next_room: str):
++        super().__init__(original_user, run)
+         self.next_room = next_room
++        if run['current_room'] == len(run['room_sequence']) - 1:
++            self.next.label = "Next Floor"
+ 
+     # --- DO NOT DELETE ---
+     # in the future, there will be up to three room selections per block, and
+@@ -55,134 +71,120 @@ class MapSelectionView(BaseRoomView):
+     # instead of generating buttons per available room.
+ 
+     @discord.ui.button(label="Move", style=discord.ButtonStyle.green)
+-    async def next(self: "MapSelectionView", interaction: discord.Interaction, _button: discord.ui.Button):
+-        from core.data.rooms import ROOMS
+-
+-        data = await db.fetch(user=self.original_user, run=True)
+-
+-        if not data['run']:
+-            await interaction.response.send_message("You don't have an active run.", ephemeral=True)
+-            return
+-
+-        run = data['run']
+-
+-        next_index = run['current_room'] + 1
+-        if not 0 <= run['current_room'] < next_index < len(run['room_sequence']):
+-            await interaction.response.send_message("No next room on this floor.", ephemeral=True)
+-            return
+-
+-        await db.update(user=self.original_user, advance_room=1)
+-        run = dict(run)
+-        run['current_room'] = next_index
+-        room = ROOMS[run['room_sequence'][run['current_room']]]
+-        embed = room.embed(run)
+-        view = room.view(self.original_user)
+-        await interaction.response.edit_message(embed=embed, view=view)
++    async def next(self, interaction: discord.Interaction, _button: discord.ui.Button):
++        await interaction.response.defer()
++        run = await move_room(self.original_user, self.run)
++        await self.show_result(interaction, run)
+ 
+ 
+ class CardSelectionView(BaseRoomView):
+-    def __init__(self, original_user: discord.User | discord.Member, cards: list[str], remaining_levels: list[int]):
+-        super().__init__(original_user)
+-        self.cards = cards
+-        self.remaining_levels = remaining_levels
+-
+-        for idx, card in enumerate(cards):
+-            btn = discord.ui.Button(label=f"{card}", style=discord.ButtonStyle.primary, custom_id=f"take_card_{idx}")
+-            btn.callback = self.make_callback(card)
+-            self.add_item(btn)
++    def __init__(self, original_user: discord.User | discord.Member, run):
++        super().__init__(original_user, run)
++        for idx, card in enumerate(dict.fromkeys(run['card_choices'])):
++            button = discord.ui.Button(
++                label=card, style=discord.ButtonStyle.primary, custom_id=f"take_card_{idx}",
++            )
++            button.callback = self.make_callback(card)
++            self.add_item(button)
+ 
+     def make_callback(self, card: str):
+         async def card_callback(interaction: discord.Interaction):
+-            await db.update(user=self.original_user, deck=card)
+-
+-            if self.remaining_levels:
+-                next_level = self.remaining_levels[0]
+-                next_cards = generate_card(level=next_level)
+-                self.remaining_levels.pop(0)
+-                
+-                view: BaseRoomView = CardSelectionView(self.original_user, next_cards, self.remaining_levels)
+-                embed = discord.Embed(title=f"Level Up! (Level {next_level})", description="Choose a card:")
+-                await interaction.response.edit_message(embed=embed, view=view)
+-            else:
+-                # 3. No more level ups, proceed to the next room (Basecamp)
+-                data = await db.fetch(self.original_user, run=True)
+-                if not data['run']:
+-                    await interaction.response.send_message("You don't have an active run.", ephemeral=True)
+-                    return
+-                from core.data.rooms import ROOMS
+-
+-                run = data['run']
+-                room = ROOMS["basecamp"]
+-                view = room.view(self.original_user)
+-                embed = room.embed(run)
+-                await interaction.response.edit_message(embed=embed, view=view)
+-                
++            await interaction.response.defer()
++            run = await choose_card(self.original_user, self.run, card)
++            await self.show_result(interaction, run)
+         return card_callback
+ 
+ 
+-class BasecampView(BaseRoomView):
+-    pass
+-
++class PlaceholderRoomView(BaseRoomView):
++    xp_reward = 0
+ 
+-class BattleView(BaseRoomView):
+-    @discord.ui.button(label="Next", style=discord.ButtonStyle.green)
+-    async def next(self: "BattleView", interaction: discord.Interaction, _button: discord.ui.Button):
+-        from core.data.rooms import ROOMS
++    @discord.ui.button(label="Complete Room", style=discord.ButtonStyle.green)
++    async def complete(self, interaction: discord.Interaction, _button: discord.ui.Button):
++        await interaction.response.defer()
++        run = await complete_room(self.original_user, self.run, xp=self.xp_reward)
++        await self.show_result(interaction, run)
+ 
+-        data = await db.fetch(self.original_user, run=True)
+-        if not data['run']:
+-            await interaction.response.send_message("You don't have an active run.", ephemeral=True)
+-            return
+ 
+-        run = data['run']
+-        current_level = run['run_level']
+-        
+-        level_increment, xp = on_gain_xp(run, xp=100) # temp placeholder xp
+-        await db.update(user=self.original_user, xp=xp, levelup=level_increment)
+-        if level_increment > 0:
+-            levels_to_process = [current_level + i + 1 for i in range(level_increment)]
+-            
+-            first_level = levels_to_process.pop(0)
+-            cards = generate_card(level=first_level)
+-            
+-            view: BaseRoomView = CardSelectionView(self.original_user, cards, levels_to_process)
+-            embed = discord.Embed(title=f"Level Up! (Level {first_level})", description="Choose a card:")
+-            await interaction.response.edit_message(embed=embed, view=view)
+-        else:
+-            next_room_name = run["room_sequence"][run["current_room"]]
++class BasecampView(PlaceholderRoomView):
++    pass
+ 
+-            room = ROOMS[next_room_name]
+-            view = room.view(self.original_user)
+-            updated_run = dict(run)
+-            updated_run.update(xp=xp, run_level=current_level + level_increment)
+-            embed = room.embed(updated_run)
+-            await interaction.response.edit_message(embed=embed, view=view)
+ 
++class BattleView(PlaceholderRoomView):
++    xp_reward = 100
+ 
+ 
+-class EventView(BaseRoomView):
++class EventView(PlaceholderRoomView):
+     pass
+ 
+ 
+-class FountainView(BaseRoomView):
++class FountainView(PlaceholderRoomView):
+     pass
+ 
+ 
+-class MarketView(BaseRoomView):
++class MarketView(PlaceholderRoomView):
+     pass
+ 
+ 
+-class BlacksmithView(BaseRoomView):
++class BlacksmithView(PlaceholderRoomView):
+     pass
+ 
+ 
+-class CursedView(BaseRoomView):
++class CursedView(PlaceholderRoomView):
+     pass
+ 
+ 
+-class BossView(BaseRoomView):
++class BossView(PlaceholderRoomView):
+     pass
+ 
+ 
+-class FinalbossView(BaseRoomView):
++class FinalbossView(PlaceholderRoomView):
+     pass
++
++
++class VictoryView(BaseRoomView):
++    @discord.ui.button(label="Finish Run", style=discord.ButtonStyle.green)
++    async def finish(self, interaction: discord.Interaction, _button: discord.ui.Button):
++        await interaction.response.defer()
++        if not await on_death(self.original_user, victory=True, state_id=self.run['state_id']):
++            await interaction.followup.send("Unable to finish this run. Use `!run` to resume.", ephemeral=True)
++            return
++        await interaction.edit_original_response(content="Run complete! Use `!run` to start again.", embed=None, view=None)
++        self.stop()
++
++
++def run_screen(user: discord.User | discord.Member, run):
++    from core.data.rooms import ROOMS
++
++    if run['pending_levels']:
++        level = run['pending_levels'][0]
++        embed = discord.Embed(title=f"Level Up! (Level {level})", description="Choose a card:")
++        return embed, CardSelectionView(user, run)
++
++    if run_finished(run):
++        embed = discord.Embed(
++            title="Run Complete", description=f"You completed all {MAX_FLOORS} placeholder floors!",
++            color=discord.Color.green(),
++        )
++        return embed, VictoryView(user, run)
++
++    if run['room_completed']:
++        next_index = run['current_room'] + 1
++        next_room = run['room_sequence'][next_index] if next_index < len(run['room_sequence']) else "basecamp"
++        embed = MapSelectionEmbed(run['current_floor'], run['room_sequence'], run['current_room'])
++        if next_index == len(run['room_sequence']):
++            embed.add_field(name="Next Floor", value=f"Floor {run['current_floor'] + 1}: Basecamp", inline=False)
++        else:
++            embed.add_field(name="Next Room", value=ROOMS[next_room].embed.room_title, inline=False)
++        return embed, MapSelectionView(user, run, next_room)
++
++    room = ROOMS[run['room_sequence'][run['current_room']]]
++    return room.embed(run), room.view(user, run)
++
++
++async def show_run(interaction: discord.Interaction, run) -> bool:
++    if run is None:
++        await interaction.followup.send("This screen has expired. Use `!run` to resume.", ephemeral=True)
++        return False
++    embed, view = run_screen(interaction.user, run)
++    await interaction.edit_original_response(content=None, embed=embed, view=view)
++    return True
+diff --git a/migrations/001_run_transitions.sql b/migrations/001_run_transitions.sql
+new file mode 100644
+index 0000000000000000000000000000000000000000..9676058ae90f74cecb90cb52ce86d7161abd2590
+--- /dev/null
++++ b/migrations/001_run_transitions.sql
+@@ -0,0 +1,10 @@
++BEGIN;
++
++ALTER TABLE runs
++    ADD COLUMN IF NOT EXISTS current_floor integer NOT NULL DEFAULT 1,
++    ADD COLUMN IF NOT EXISTS room_completed boolean NOT NULL DEFAULT false,
++    ADD COLUMN IF NOT EXISTS pending_levels integer[] NOT NULL DEFAULT ARRAY[]::integer[],
++    ADD COLUMN IF NOT EXISTS card_choices text[] NOT NULL DEFAULT ARRAY[]::text[],
++    ADD COLUMN IF NOT EXISTS state_id uuid NOT NULL DEFAULT gen_random_uuid();
++
++COMMIT;
+diff --git a/tests/test_run_transitions.py b/tests/test_run_transitions.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..89ed49aa36c72aab1bb4c885c92a60ec1db20381
+--- /dev/null
++++ b/tests/test_run_transitions.py
+@@ -0,0 +1,298 @@
++import copy
++import unittest
++from types import SimpleNamespace
++from unittest.mock import AsyncMock, patch
++from uuid import uuid4
++
++from core.data.cards import CARDS
++from core.data.rooms import ROOMS
++from core.lib import db, run_lib
++from core.ui import run_ui
++
++
++def new_run(**fields):
++    run = {
++        "user_id": 1, "hp": 100, "xp": 0, "run_level": 1,
++        "rank_snapshot": 0, "deck": [], "current_floor": 1,
++        "current_room": 0, "room_sequence": [], "room_completed": False,
++        "pending_levels": [], "card_choices": [], "state_id": uuid4(),
++    }
++    run.update(fields)
++    return run
++
++
++def interaction(user):
++    return SimpleNamespace(
++        user=user,
++        response=SimpleNamespace(defer=AsyncMock(), send_message=AsyncMock(), edit_message=AsyncMock()),
++        followup=SimpleNamespace(send=AsyncMock()),
++        edit_original_response=AsyncMock(),
++    )
++
++
++class TransitionTests(unittest.IsolatedAsyncioTestCase):
++    async def asyncSetUp(self):
++        self.user = SimpleNamespace(id=1)
++        self.saved = new_run()
++
++        async def update(user, state_id, **fields):
++            if self.saved is None or user.id != self.saved['user_id'] or state_id != self.saved['state_id']:
++                return None
++            self.saved.update(copy.deepcopy(fields), state_id=uuid4())
++            return copy.deepcopy(self.saved)
++
++        async def fetch(user, **fields):
++            return {"run": copy.deepcopy(self.saved)}
++
++        self.update = AsyncMock(side_effect=update)
++        self.fetch = AsyncMock(side_effect=fetch)
++        self.patchers = [
++            patch.object(db, 'update_run_state', self.update),
++            patch.object(db, 'fetch', self.fetch),
++        ]
++        for patcher in self.patchers:
++            patcher.start()
++            self.addCleanup(patcher.stop)
++
++    async def generate(self, floor=1):
++        return await run_lib.generate_rooms(self.user, 0, floor, state_id=self.saved['state_id'])
++
++    async def test_confirmation_generates_before_render(self):
++        event = interaction(self.user)
++        confirmation = run_ui.RunConfirmationView(self.user)
++        with patch.object(db, 'create_run', AsyncMock(return_value=copy.deepcopy(self.saved))):
++            await run_lib.start_run(event, confirmation)
++        event.response.defer.assert_awaited_once()
++        screen = event.edit_original_response.await_args.kwargs
++        self.assertEqual(screen['embed'].title, 'Basecamp')
++        self.assertIsInstance(screen['view'], run_ui.BasecampView)
++        self.assertEqual(len(self.saved['room_sequence']), 6)
++        self.assertEqual(self.saved['current_room'], 0)
++        self.assertTrue(confirmation.is_finished())
++
++    async def test_duplicate_confirmation_resumes_existing_state(self):
++        await self.generate()
++        self.saved.update(room_completed=True)
++        before = copy.deepcopy(self.saved)
++        event = interaction(self.user)
++        with patch.object(db, 'create_run', AsyncMock(return_value=None)):
++            await run_lib.start_run(event, run_ui.RunConfirmationView(self.user))
++        self.assertEqual(self.saved, before)
++        self.assertIsInstance(event.edit_original_response.await_args.kwargs['view'], run_ui.MapSelectionView)
++
++    async def test_cancel_does_not_create_a_run(self):
++        event = interaction(self.user)
++        view = run_ui.RunConfirmationView(self.user)
++        await view.cancel_run.callback(event)
++        self.update.assert_not_awaited()
++        self.fetch.assert_not_awaited()
++        self.assertTrue(view.is_finished())
++
++    async def test_all_placeholder_views_report_completion(self):
++        for room_name, room in ROOMS.items():
++            with self.subTest(room=room_name):
++                self.saved = new_run(room_sequence=[room_name, 'boss'])
++                embed, view = run_ui.run_screen(self.user, copy.deepcopy(self.saved))
++                self.assertEqual(embed.title, room.embed.room_title)
++                self.assertEqual(view.complete.label, 'Complete Room')
++                event = interaction(self.user)
++                await view.complete.callback(event)
++                self.assertEqual(self.saved['current_room'], 0)
++                self.assertTrue(self.saved['room_completed'])
++                result = event.edit_original_response.await_args.kwargs['view']
++                expected = run_ui.CardSelectionView if room_name == 'battle' else run_ui.MapSelectionView
++                self.assertIsInstance(result, expected)
++
++    async def test_full_four_floor_loop_and_resume(self):
++        run = await self.generate()
++        for floor in range(1, 5):
++            for index in range(6):
++                self.assertEqual((run['current_floor'], run['current_room']), (floor, index))
++                room_name = run['room_sequence'][index]
++                self.assertIn(floor, ROOMS[room_name].floors)
++                self.assertEqual(run_ui.run_screen(self.user, run)[0].title, ROOMS[room_name].embed.room_title)
++                run = await run_lib.complete_room(self.user, run, xp=100 if room_name == 'battle' else 0)
++                self.assertEqual(run['current_room'], index)
++                while run['pending_levels']:
++                    resumed = await run_lib.load_run(self.user)
++                    self.assertEqual(resumed['card_choices'], run['card_choices'])
++                    self.assertIsInstance(run_ui.run_screen(self.user, resumed)[1], run_ui.CardSelectionView)
++                    run = await run_lib.choose_card(self.user, resumed, resumed['card_choices'][0])
++                resumed = await run_lib.load_run(self.user)
++                self.assertEqual(resumed, run)
++                if floor == 4 and index == 5:
++                    self.assertTrue(run_lib.run_finished(run))
++                    self.assertIsInstance(run_ui.run_screen(self.user, run)[1], run_ui.VictoryView)
++                    self.assertIsNone(await run_lib.move_room(self.user, run))
++                else:
++                    self.assertIsInstance(run_ui.run_screen(self.user, run)[1], run_ui.MapSelectionView)
++                    run = await run_lib.move_room(self.user, run)
++                    self.assertFalse(run['room_completed'])
++                    self.assertEqual(run['pending_levels'], [])
++
++    async def test_multiple_levelups_finish_before_map(self):
++        run = await self.generate()
++        run = await run_lib.complete_room(self.user, run, xp=600)
++        self.assertEqual(run['pending_levels'], [2, 3, 4, 5])
++        self.assertIsNone(await run_lib.move_room(self.user, run))
++        self.assertIsNone(await run_lib.choose_card(self.user, run, 'Missing card'))
++        for level in [2, 3, 4, 5]:
++            embed, view = run_ui.run_screen(self.user, run)
++            self.assertIn(str(level), embed.title)
++            event = interaction(self.user)
++            old_view = view
++
++            async def edit(**kwargs):
++                self.assertTrue(old_view.is_finished())
++
++            event.edit_original_response.side_effect = edit
++            await view.children[0].callback(event)
++            run = await run_lib.load_run(self.user)
++            self.assertEqual(run['current_room'], 0)
++        self.assertEqual(len(run['deck']), 4)
++        self.assertEqual(run['card_choices'], [])
++        self.assertIsInstance(run_ui.run_screen(self.user, run)[1], run_ui.MapSelectionView)
++
++    async def test_rewards_at_floor_end_do_not_skip_basecamp(self):
++        await self.generate()
++        self.saved.update(current_room=5)
++        run = await run_lib.complete_room(self.user, copy.deepcopy(self.saved), xp=100)
++        self.assertEqual(run['current_floor'], 1)
++        self.assertIsNone(await run_lib.move_room(self.user, run))
++        run = await run_lib.choose_card(self.user, run, run['card_choices'][0])
++        embed, view = run_ui.run_screen(self.user, run)
++        self.assertEqual(view.next.label, 'Next Floor')
++        event = interaction(self.user)
++        await view.next.callback(event)
++        self.assertEqual((self.saved['current_floor'], self.saved['current_room']), (2, 0))
++        self.assertEqual(event.edit_original_response.await_args.kwargs['embed'].title, 'Basecamp')
++
++    async def test_final_rewards_then_victory(self):
++        await self.generate(4)
++        self.saved.update(current_room=5)
++        run = await run_lib.complete_room(self.user, copy.deepcopy(self.saved), xp=100)
++        self.assertFalse(run_lib.run_finished(run))
++        self.assertIsInstance(run_ui.run_screen(self.user, run)[1], run_ui.CardSelectionView)
++        run = await run_lib.choose_card(self.user, run, run['card_choices'][0])
++        self.assertTrue(run_lib.run_finished(run))
++        self.assertIsInstance(run_ui.run_screen(self.user, run)[1], run_ui.VictoryView)
++
++    async def test_stale_buttons_do_not_repeat_completion_cards_or_movement(self):
++        room_run = await self.generate()
++        rewards_run = await run_lib.complete_room(self.user, room_run, xp=100)
++        self.assertIsNone(await run_lib.complete_room(self.user, room_run, xp=100))
++        card = rewards_run['card_choices'][0]
++        map_run = await run_lib.choose_card(self.user, rewards_run, card)
++        self.assertIsNone(await run_lib.choose_card(self.user, rewards_run, card))
++        next_run = await run_lib.move_room(self.user, map_run)
++        self.assertIsNone(await run_lib.move_room(self.user, map_run))
++        self.assertEqual(next_run['current_room'], 1)
++        self.assertEqual(next_run['deck'], [card])
++        self.assertEqual(next_run['run_level'], 2)
++        old_view = run_ui.MapSelectionView(self.user, map_run, map_run['room_sequence'][1])
++        event = interaction(self.user)
++        await old_view.next.callback(event)
++        event.edit_original_response.assert_not_awaited()
++        event.followup.send.assert_awaited_once()
++
++    async def test_stale_floor_map_cannot_regenerate_current_floor(self):
++        await self.generate()
++        self.saved.update(current_room=5, room_completed=True)
++        old = copy.deepcopy(self.saved)
++        run = await run_lib.move_room(self.user, old)
++        self.assertIsNone(await run_lib.move_room(self.user, old))
++        self.assertEqual(self.saved, run)
++
++    async def test_an_old_run_cannot_change_a_new_run(self):
++        run = await self.generate()
++        self.saved = new_run()
++        self.assertIsNone(await run_lib.complete_room(self.user, run, xp=100))
++        self.assertEqual(self.saved['room_sequence'], [])
++
++    async def test_resume_repairs_empty_sequence_and_keeps_existing_sequence(self):
++        run = await run_lib.load_run(self.user)
++        self.assertEqual(len(run['room_sequence']), 6)
++        before = copy.deepcopy(self.saved)
++        self.assertEqual(await run_lib.load_run(self.user), before)
++        self.assertEqual(self.update.await_count, 1)
++
++    async def test_room_requires_completion_before_move(self):
++        run = await self.generate()
++        self.assertIsNone(await run_lib.move_room(self.user, run))
++        self.assertEqual(self.saved['current_room'], 0)
++
++    async def test_other_players_cannot_use_buttons(self):
++        run = await self.generate()
++        view = run_ui.run_screen(self.user, run)[1]
++        event = interaction(SimpleNamespace(id=2))
++        self.assertFalse(await view.interaction_check(event))
++        event.response.send_message.assert_awaited_once()
++        view.stop()
++        event = interaction(self.user)
++        self.assertFalse(await view.interaction_check(event))
++
++    async def test_finish_uses_existing_victory_handler(self):
++        await self.generate(4)
++        self.saved.update(current_room=5, room_completed=True)
++        run = copy.deepcopy(self.saved)
++        view = run_ui.run_screen(self.user, run)[1]
++        event = interaction(self.user)
++        with patch.object(run_ui, 'on_death', AsyncMock(return_value=True)) as finish:
++            await view.finish.callback(event)
++        finish.assert_awaited_once_with(self.user, victory=True, state_id=run['state_id'])
++        self.assertTrue(view.is_finished())
++        self.assertIsNone(event.edit_original_response.await_args.kwargs['view'])
++
++    async def test_guarded_end_prevents_duplicate_relic_rewards(self):
++        self.fetch.side_effect = None
++        self.fetch.return_value = {"player": {"user_id": 1}, "equipment": {"weapon": {"tier": db.GearTier.rare}}}
++        state_id = self.saved['state_id']
++        with patch.object(db, 'endrun', AsyncMock(side_effect=[self.saved, None])) as end:
++            with patch.object(db, 'update', AsyncMock()) as reward:
++                self.assertTrue(await run_lib.on_death(self.user, True, state_id=state_id))
++                self.assertFalse(await run_lib.on_death(self.user, True, state_id=state_id))
++        end.assert_awaited_with(self.user, state_id=state_id)
++        reward.assert_awaited_once_with(self.user, relic=120)
++
++
++class CardTests(unittest.TestCase):
++    def test_placeholder_catalog_supports_all_rarity_brackets(self):
++        for level in range(26):
++            for _ in range(20):
++                cards = run_lib.generate_card(level)
++                self.assertEqual(len(cards), 2)
++                self.assertEqual(len(set(cards)), 2)
++                self.assertTrue(set(cards) <= CARDS.keys())
++
++
++class DatabaseContractTests(unittest.IsolatedAsyncioTestCase):
++    async def test_state_write_guards_user_and_snapshot_and_returns_saved_record(self):
++        conn = SimpleNamespace(fetchrow=AsyncMock(return_value={"current_room": 1}))
++        user = SimpleNamespace(id=1)
++        state_id = uuid4()
++        result = await db.update_run_state.__wrapped__(user, state_id, conn=conn, current_room=1, room_completed=False)
++        query, *values = conn.fetchrow.await_args.args
++        self.assertIn('state_id = gen_random_uuid()', query)
++        self.assertIn('WHERE user_id = $1 AND state_id = $2 RETURNING *', query)
++        self.assertIn('current_room = $3', query)
++        self.assertEqual(values, [1, state_id, 1, False])
++        self.assertEqual(result, {"current_room": 1})
++
++    async def test_state_write_rejects_unknown_columns(self):
++        conn = SimpleNamespace(fetchrow=AsyncMock())
++        with self.assertRaises(ValueError):
++            await db.update_run_state.__wrapped__(SimpleNamespace(id=1), uuid4(), conn=conn, unexpected=1)
++        conn.fetchrow.assert_not_awaited()
++
++    async def test_endrun_requires_matching_state_id_when_given(self):
++        conn = SimpleNamespace(fetchrow=AsyncMock(return_value=None))
++        state_id = uuid4()
++        result = await db.endrun.__wrapped__(SimpleNamespace(id=1), state_id=state_id, conn=conn)
++        query, user_id, token = conn.fetchrow.await_args.args
++        self.assertIn('state_id = $2', query)
++        self.assertEqual((user_id, token), (1, state_id))
++        self.assertIsNone(result)
++
++
++if __name__ == '__main__':
++    unittest.main()

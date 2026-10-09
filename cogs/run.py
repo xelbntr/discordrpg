@@ -1,6 +1,6 @@
 from discord.ext import commands
-from core.ui.run_ui import RunConfirmationView, BaseRoomView
-from core.data.rooms import ROOMS
+from core.ui.run_ui import RunConfirmationView, run_screen
+from core.lib.run_lib import load_run
 from core.lib import db
 
 
@@ -11,18 +11,13 @@ class Run(commands.Cog):
     @commands.command()
     @db.requires_player()
     async def run(self, ctx):
-        data = await db.fetch(ctx.author, run=True)
-        run = data['run']
+        run = await load_run(ctx.author)
         if run:
-            room_name = run["room_sequence"][run["current_room"]]
-            main_run_embed = ROOMS[room_name].embed(run)
-            main_run_view: type[BaseRoomView] = ROOMS[room_name].view
-
-            view: BaseRoomView = main_run_view(ctx.author)
-            view.message = await ctx.send(embed=main_run_embed, view=view, ephemeral=True)
+            embed, view = run_screen(ctx.author, run)
+            await ctx.send(embed=embed, view=view)
         else:
             view = RunConfirmationView(ctx.author)
-            view.message = await ctx.send("Start a run?", view=view, ephemeral=True)
+            view.message = await ctx.send("Start a run?", view=view)
 
 async def setup(bot):
     await bot.add_cog(Run(bot))

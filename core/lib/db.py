@@ -172,11 +172,58 @@ async def reset_floor(
     return True
 
 @db_exception_handler
+async def create_run(
+    user: discord.User | discord.Member,
+    hp: int,
+    *,
+    conn: asyncpg.Connection | None = None,
+):
+    return await conn.fetchrow('''
+        INSERT INTO runs (user_id, hp, rank_snapshot, current_room)
+        SELECT $1, $2, rank, 0
+        FROM players
+        WHERE user_id = $1
+        ON CONFLICT (user_id) DO NOTHING
+        RETURNING *;
+    ''', user.id, hp)
+
+RUN_STATE_FIELDS = {
+    "xp", "run_level", "deck", "current_floor", "current_room",
+    "room_sequence", "room_completed", "pending_levels", "card_choices",
+}
+
+@db_exception_handler
+async def update_run_state(
+    user: discord.User | discord.Member,
+    state_id,
+    *,
+    conn: asyncpg.Connection | None = None,
+    **kwargs,
+):
+    unknown = kwargs.keys() - RUN_STATE_FIELDS
+    if unknown:
+        raise ValueError(f"Unknown run fields: {', '.join(sorted(unknown))}")
+
+    assignments = ["state_id = gen_random_uuid()"]
+    values = [user.id, state_id]
+    for field, value in kwargs.items():
+        values.append(value)
+        assignments.append(f"{field} = ${len(values)}")
+
+    return await conn.fetchrow(
+        f"UPDATE runs SET {', '.join(assignments)} "
+        "WHERE user_id = $1 AND state_id = $2 RETURNING *",
+        *values,
+    )
+
+@db_exception_handler
 async def endrun(
     user: discord.User,
+    state_id=None,
     *,
     conn: asyncpg.Connection | None = None
 ):
-    await conn.fetchrow('DELETE FROM runs WHERE user_id = $1', user.id)
-
-    return None
+    return await conn.fetchrow(
+        'DELETE FROM runs WHERE user_id = $1 AND ($2::uuid IS NULL OR state_id = $2) RETURNING *',
+        user.id, state_id,
+    )
