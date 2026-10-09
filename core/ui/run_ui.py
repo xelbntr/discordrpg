@@ -1,7 +1,11 @@
 import discord
 
-from core.lib import db
-from core.lib.run_lib import generate_card, on_gain_xp, start_run
+from core.lib.run_lib import (
+    MAX_FLOORS, choose_card, complete_room, move_room, on_death,
+    run_finished, start_run,
+)
+from core.ui.run_embed import MapSelectionEmbed
+
 
 class RunConfirmationView(discord.ui.View):
     def __init__(self, original_user: discord.User | discord.Member):
@@ -11,6 +15,7 @@ class RunConfirmationView(discord.ui.View):
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user != self.original_user:
+            await interaction.response.send_message("This run belongs to another player.", ephemeral=True)
             return False
         return True
 
@@ -22,31 +27,42 @@ class RunConfirmationView(discord.ui.View):
             await self.message.edit(view=self)
 
     @discord.ui.button(label="Yes", style=discord.ButtonStyle.green)
-    async def confirm_run(self: "RunConfirmationView", interaction: discord.Interaction, _button: discord.ui.Button):
+    async def confirm_run(self, interaction: discord.Interaction, _button: discord.ui.Button):
         await start_run(interaction, self)
 
     @discord.ui.button(label="No", style=discord.ButtonStyle.red)
-    async def cancel_run(self: "RunConfirmationView", interaction: discord.Interaction, _button: discord.ui.Button):
+    async def cancel_run(self, interaction: discord.Interaction, _button: discord.ui.Button):
         await interaction.response.edit_message(content="Run cancelled.", view=None)
         self.stop()
 
 
 class BaseRoomView(discord.ui.View):
-    def __init__(self, original_user: discord.User | discord.Member):
+    def __init__(self, original_user: discord.User | discord.Member, run):
         super().__init__(timeout=None)
         self.original_user = original_user
-        self.message: discord.Message | None = None
+        self.run = run
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user != self.original_user:
+            await interaction.response.send_message("This run belongs to another player.", ephemeral=True)
+            return False
+        if self.is_finished():
+            await interaction.response.send_message("This screen has expired. Use `!run` to resume.", ephemeral=True)
             return False
         return True
 
+    async def show_result(self, interaction: discord.Interaction, run):
+        if run is not None:
+            self.stop()
+        await show_run(interaction, run)
+
 
 class MapSelectionView(BaseRoomView):
-    def __init__(self, original_user: discord.User | discord.Member, next_room):
-        super().__init__(original_user)
+    def __init__(self, original_user: discord.User | discord.Member, run, next_room: str):
+        super().__init__(original_user, run)
         self.next_room = next_room
+        if run['current_room'] == len(run['room_sequence']) - 1:
+            self.next.label = "Next Floor"
 
     # --- DO NOT DELETE ---
     # in the future, there will be up to three room selections per block, and
@@ -55,134 +71,120 @@ class MapSelectionView(BaseRoomView):
     # instead of generating buttons per available room.
 
     @discord.ui.button(label="Move", style=discord.ButtonStyle.green)
-    async def next(self: "MapSelectionView", interaction: discord.Interaction, _button: discord.ui.Button):
-        from core.data.rooms import ROOMS
-
-        data = await db.fetch(user=self.original_user, run=True)
-
-        if not data['run']:
-            await interaction.response.send_message("You don't have an active run.", ephemeral=True)
-            return
-
-        run = data['run']
-
-        next_index = run['current_room'] + 1
-        if not 0 <= run['current_room'] < next_index < len(run['room_sequence']):
-            await interaction.response.send_message("No next room on this floor.", ephemeral=True)
-            return
-
-        await db.update(user=self.original_user, advance_room=1)
-        run = dict(run)
-        run['current_room'] = next_index
-        room = ROOMS[run['room_sequence'][run['current_room']]]
-        embed = room.embed(run)
-        view = room.view(self.original_user)
-        await interaction.response.edit_message(embed=embed, view=view)
+    async def next(self, interaction: discord.Interaction, _button: discord.ui.Button):
+        await interaction.response.defer()
+        run = await move_room(self.original_user, self.run)
+        await self.show_result(interaction, run)
 
 
 class CardSelectionView(BaseRoomView):
-    def __init__(self, original_user: discord.User | discord.Member, cards: list[str], remaining_levels: list[int]):
-        super().__init__(original_user)
-        self.cards = cards
-        self.remaining_levels = remaining_levels
-
-        for idx, card in enumerate(cards):
-            btn = discord.ui.Button(label=f"{card}", style=discord.ButtonStyle.primary, custom_id=f"take_card_{idx}")
-            btn.callback = self.make_callback(card)
-            self.add_item(btn)
+    def __init__(self, original_user: discord.User | discord.Member, run):
+        super().__init__(original_user, run)
+        for idx, card in enumerate(dict.fromkeys(run['card_choices'])):
+            button = discord.ui.Button(
+                label=card, style=discord.ButtonStyle.primary, custom_id=f"take_card_{idx}",
+            )
+            button.callback = self.make_callback(card)
+            self.add_item(button)
 
     def make_callback(self, card: str):
         async def card_callback(interaction: discord.Interaction):
-            await db.update(user=self.original_user, deck=card)
-
-            if self.remaining_levels:
-                next_level = self.remaining_levels[0]
-                next_cards = generate_card(level=next_level)
-                self.remaining_levels.pop(0)
-                
-                view: BaseRoomView = CardSelectionView(self.original_user, next_cards, self.remaining_levels)
-                embed = discord.Embed(title=f"Level Up! (Level {next_level})", description="Choose a card:")
-                await interaction.response.edit_message(embed=embed, view=view)
-            else:
-                # 3. No more level ups, proceed to the next room (Basecamp)
-                data = await db.fetch(self.original_user, run=True)
-                if not data['run']:
-                    await interaction.response.send_message("You don't have an active run.", ephemeral=True)
-                    return
-                from core.data.rooms import ROOMS
-
-                run = data['run']
-                room = ROOMS["basecamp"]
-                view = room.view(self.original_user)
-                embed = room.embed(run)
-                await interaction.response.edit_message(embed=embed, view=view)
-                
+            await interaction.response.defer()
+            run = await choose_card(self.original_user, self.run, card)
+            await self.show_result(interaction, run)
         return card_callback
 
 
-class BasecampView(BaseRoomView):
+class PlaceholderRoomView(BaseRoomView):
+    xp_reward = 0
+
+    @discord.ui.button(label="Complete Room", style=discord.ButtonStyle.green)
+    async def complete(self, interaction: discord.Interaction, _button: discord.ui.Button):
+        await interaction.response.defer()
+        run = await complete_room(self.original_user, self.run, xp=self.xp_reward)
+        await self.show_result(interaction, run)
+
+
+class BasecampView(PlaceholderRoomView):
     pass
 
 
-class BattleView(BaseRoomView):
-    @discord.ui.button(label="Next", style=discord.ButtonStyle.green)
-    async def next(self: "BattleView", interaction: discord.Interaction, _button: discord.ui.Button):
-        from core.data.rooms import ROOMS
+class BattleView(PlaceholderRoomView):
+    xp_reward = 100
 
-        data = await db.fetch(self.original_user, run=True)
-        if not data['run']:
-            await interaction.response.send_message("You don't have an active run.", ephemeral=True)
+
+class EventView(PlaceholderRoomView):
+    pass
+
+
+class FountainView(PlaceholderRoomView):
+    pass
+
+
+class MarketView(PlaceholderRoomView):
+    pass
+
+
+class BlacksmithView(PlaceholderRoomView):
+    pass
+
+
+class CursedView(PlaceholderRoomView):
+    pass
+
+
+class BossView(PlaceholderRoomView):
+    pass
+
+
+class FinalbossView(PlaceholderRoomView):
+    pass
+
+
+class VictoryView(BaseRoomView):
+    @discord.ui.button(label="Finish Run", style=discord.ButtonStyle.green)
+    async def finish(self, interaction: discord.Interaction, _button: discord.ui.Button):
+        await interaction.response.defer()
+        if not await on_death(self.original_user, victory=True, state_id=self.run['state_id']):
+            await interaction.followup.send("Unable to finish this run. Use `!run` to resume.", ephemeral=True)
             return
+        await interaction.edit_original_response(content="Run complete! Use `!run` to start again.", embed=None, view=None)
+        self.stop()
 
-        run = data['run']
-        current_level = run['run_level']
-        
-        level_increment, xp = on_gain_xp(run, xp=100) # temp placeholder xp
-        await db.update(user=self.original_user, xp=xp, levelup=level_increment)
-        if level_increment > 0:
-            levels_to_process = [current_level + i + 1 for i in range(level_increment)]
-            
-            first_level = levels_to_process.pop(0)
-            cards = generate_card(level=first_level)
-            
-            view: BaseRoomView = CardSelectionView(self.original_user, cards, levels_to_process)
-            embed = discord.Embed(title=f"Level Up! (Level {first_level})", description="Choose a card:")
-            await interaction.response.edit_message(embed=embed, view=view)
+
+def run_screen(user: discord.User | discord.Member, run):
+    from core.data.rooms import ROOMS
+
+    if run['pending_levels']:
+        level = run['pending_levels'][0]
+        embed = discord.Embed(title=f"Level Up! (Level {level})", description="Choose a card:")
+        return embed, CardSelectionView(user, run)
+
+    if run_finished(run):
+        embed = discord.Embed(
+            title="Run Complete", description=f"You completed all {MAX_FLOORS} placeholder floors!",
+            color=discord.Color.green(),
+        )
+        return embed, VictoryView(user, run)
+
+    if run['room_completed']:
+        next_index = run['current_room'] + 1
+        next_room = run['room_sequence'][next_index] if next_index < len(run['room_sequence']) else "basecamp"
+        embed = MapSelectionEmbed(run['current_floor'], run['room_sequence'], run['current_room'])
+        if next_index == len(run['room_sequence']):
+            embed.add_field(name="Next Floor", value=f"Floor {run['current_floor'] + 1}: Basecamp", inline=False)
         else:
-            next_room_name = run["room_sequence"][run["current_room"]]
+            embed.add_field(name="Next Room", value=ROOMS[next_room].embed.room_title, inline=False)
+        return embed, MapSelectionView(user, run, next_room)
 
-            room = ROOMS[next_room_name]
-            view = room.view(self.original_user)
-            updated_run = dict(run)
-            updated_run.update(xp=xp, run_level=current_level + level_increment)
-            embed = room.embed(updated_run)
-            await interaction.response.edit_message(embed=embed, view=view)
+    room = ROOMS[run['room_sequence'][run['current_room']]]
+    return room.embed(run), room.view(user, run)
 
 
-
-class EventView(BaseRoomView):
-    pass
-
-
-class FountainView(BaseRoomView):
-    pass
-
-
-class MarketView(BaseRoomView):
-    pass
-
-
-class BlacksmithView(BaseRoomView):
-    pass
-
-
-class CursedView(BaseRoomView):
-    pass
-
-
-class BossView(BaseRoomView):
-    pass
-
-
-class FinalbossView(BaseRoomView):
-    pass
+async def show_run(interaction: discord.Interaction, run) -> bool:
+    if run is None:
+        await interaction.followup.send("This screen has expired. Use `!run` to resume.", ephemeral=True)
+        return False
+    embed, view = run_screen(interaction.user, run)
+    await interaction.edit_original_response(content=None, embed=embed, view=view)
+    return True

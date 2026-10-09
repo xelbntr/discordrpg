@@ -22,6 +22,8 @@ class BaseRoomEmbed(discord.Embed):
         )
         self.add_field(name="HP", value=str(run["hp"]))
         self.add_field(name="XP", value=str(run["xp"]))
+        self.add_field(name="Level", value=str(run["run_level"]))
+        self.set_footer(text=f"Floor {run['current_floor']} • Room {run['current_room'] + 1} • Placeholder: Complete Room to continue")
 
 
 class MapSelectionEmbed(discord.Embed):
